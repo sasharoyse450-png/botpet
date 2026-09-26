@@ -2,7 +2,7 @@ import os
 import random
 import asyncio
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -48,6 +48,7 @@ def is_admin(uid): return uid in ADMIN_IDS
 def gen_code(n=6): return "".join(random.choice(CODE_CHARS) for _ in range(n))
 def webapp_url(pid): return f"{WEBAPP_URL}?pet={pid}"
 def is_uuid(s): return s and len(s) >= 30 and "-" in s
+def escape_html(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 
 def pet_line(p):
@@ -85,16 +86,10 @@ def many(q):
 
 
 def my_pets(uid):
-    """Все питомцы пользователя (по owner_id)."""
     return many(sb.table("pets").select("*").eq("owner_id", uid))
 
 
 async def resolve_pet(message: Message, args: list):
-    """
-    Если args[0] — UUID, берёт питомца по ID и возвращает (pet, rest_args).
-    Иначе — если у юзера 1 питомец, берёт его. Если >1 — отказывает и показывает список.
-    Возвращает (None, None) при ошибке.
-    """
     if args and is_uuid(args[0].strip()):
         pid = args[0].strip()
         pet = one(sb.table("pets").select("*").eq("id", pid))
@@ -256,7 +251,15 @@ async def cmd_start(message: Message):
         await run_salary_pet(parts[0], user.id, cents/100.0, top_n, message); return
 
     await message.answer(
-        "👋 Бот общего питомца.\n\nСоздай питомца — получишь ссылку для друзей.",
+        "👋 Бот общего питомца.\n\n"
+        "Создай питомца — получишь ссылку для друзей.\n\n"
+        "В группе можно управлять питомцем командами:\n"
+        "<code>/pet имя покормить</code>\n"
+        "<code>/pet имя погладить</code>\n"
+        "<code>/pet имя играть</code>\n"
+        "<code>/pet имя помыть</code>\n"
+        "<code>/pet имя лечить</code>",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🐣 Создать питомца", callback_data="create")],
             [InlineKeyboardButton(text="📋 Мои питомцы", callback_data="my_pets")]]))
@@ -455,6 +458,258 @@ async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
     await message.answer(text, parse_mode="HTML")
 
 
+# ============ /pet — управление через чат ============
+
+PET_ACTIONS = {
+    "feed": {"emoji":"🍖","label":"Покормил","cd": 5*60, "xp": 2,
+             "effects": {"hunger": 25, "energy": 10}, "score": 1},
+    "pet":  {"emoji":"✋","label":"Погладил","cd": 60,   "xp": 1,
+             "effects": {"mood": 10}, "score": 1},
+    "play": {"emoji":"🎾","label":"Поиграл","cd": 10*60, "xp": 5,
+             "effects": {"mood": 20, "energy": -15}, "score": 2},
+    "wash": {"emoji":"🧼","label":"Помыл","cd": 15*60, "xp": 2,
+             "effects": {"clean": 30}, "score": 1},
+    "heal": {"emoji":"💊","label":"Полечил","cd": 60*60, "xp": 3,
+             "effects": {"health": 20}, "score": -30, "cost": 30},
+}
+
+PET_ALIASES = {
+    "покормить":"feed","покорми":"feed","кормить":"feed","feed":"feed","еда":"feed","кушать":"feed",
+    "погладить":"pet","погладь":"pet","гладить":"pet","ласка":"pet","pet":"pet",
+    "играть":"play","поиграть":"play","поиграй":"play","play":"play","игра":"play",
+    "помыть":"wash","помой":"wash","мыть":"wash","купать":"wash","искупать":"wash","wash":"wash",
+    "лечить":"heal","полечить":"heal","вылечить":"heal","heal":"heal","лечение":"heal",
+    "инфо":"info","статы":"info","stats":"info","информация":"info",
+}
+
+PET_STAGE_NAMES = {
+    "classic": ["Яйцо","Птенец","Юнец","Подросток","Взрослый","Опытный","Старейшина","Легенда"],
+    "cat":     ["Яйцо","Котёнок","Котик","Подросший кот","Крупный кот","Хищник","Царь зверей","Тигр"],
+    "dragon":  ["Яйцо","Ящерка","Дракончик","Юный дракон","Дракон","Взрослый дракон","Древний дракон","Огненный владыка"],
+    "space":   ["Туманность","Луна","Звезда","Яркая звезда","Созвездие","Комета","Сверхновая","Солнце"],
+    "dino":    ["Яйцо","Ящерка","Динозаврик","Юный дино","Ящер","Хищный дино","Древний ящер","Вулкан"],
+}
+
+
+def _stage_idx(level):
+    return 7 if level>=28 else 6 if level>=24 else 5 if level>=20 else 4 if level>=16 \
+        else 3 if level>=12 else 2 if level>=8 else 1 if level>=4 else 0
+
+
+def apply_pet_tick(pet):
+    now = datetime.now(timezone.utc)
+    last_str = pet.get("last_tick_at")
+    if not last_str: return pet
+    try:
+        last = datetime.fromisoformat(last_str.replace("Z","+00:00"))
+    except Exception:
+        return pet
+    minutes = (now - last).total_seconds() / 60
+    if minutes < 1: return pet
+    hours = minutes / 60
+    m = now.month
+    is_winter = m in (12,1,2); is_summer = m in (6,7,8)
+    e_rate = 2.5 if is_winter else 2
+    m_rate = 2.5 if is_summer else 3
+
+    def cl(v, mn=0, mx=100): return max(mn, min(mx, round(v)))
+
+    c = dict(pet)
+    c["hunger"] = cl((c.get("hunger") or 100) - 3*hours)
+    c["mood"]   = cl((c.get("mood") or 100) - m_rate*hours)
+    c["energy"] = cl((c.get("energy") or 100) - e_rate*hours)
+    c["clean"]  = cl((c.get("clean") or 100) - 2*hours)
+    if c["hunger"] < 20 or c["clean"] < 20:
+        c["health"] = cl((c.get("health") or 100) - 5*hours)
+    elif c["hunger"] > 60 and c["mood"] > 60 and c["clean"] > 60:
+        c["health"] = cl((c.get("health") or 100) + 2*hours)
+    c["last_tick_at"] = now.isoformat()
+    return c
+
+
+def save_pet_tick(pet):
+    ticked = apply_pet_tick(pet)
+    if ticked.get("last_tick_at") != pet.get("last_tick_at"):
+        sb.table("pets").update({
+            "hunger": ticked["hunger"], "mood": ticked["mood"],
+            "energy": ticked["energy"], "clean": ticked["clean"],
+            "health": ticked["health"], "last_tick_at": ticked["last_tick_at"],
+        }).eq("id", pet["id"]).execute()
+    return ticked
+
+
+async def _send_pet_info(message, pet):
+    pet = save_pet_tick(pet)
+    lvl = min(30, (pet.get("xp") or 0) // 50 + 1)
+    st = _stage_idx(lvl)
+    names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
+    text = (
+        f"🐾 <b>{pet['name']}</b> · {names[st]} · ур. {lvl}\n\n"
+        f"🍖 Сытость: {pet.get('hunger',0)}%\n"
+        f"😊 Настроение: {pet.get('mood',0)}%\n"
+        f"⚡ Энергия: {pet.get('energy',0)}%\n"
+        f"🧼 Чистота: {pet.get('clean',0)}%\n"
+        f"❤️ Здоровье: {pet.get('health',0)}%\n\n"
+        f"<b>Действия:</b>\n"
+        f"<code>/pet {pet['name']} покормить</code>\n"
+        f"<code>/pet {pet['name']} погладить</code>\n"
+        f"<code>/pet {pet['name']} играть</code>\n"
+        f"<code>/pet {pet['name']} помыть</code>\n"
+        f"<code>/pet {pet['name']} лечить</code>"
+    )
+    await message.answer(text, parse_mode="HTML")
+
+
+@dp.message(Command("pet"))
+async def cmd_pet(message: Message):
+    user = message.from_user
+    parts = (message.text or "").split()
+    args = parts[1:] if len(parts) > 1 else []
+
+    if not args:
+        members = many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
+        if not members:
+            await message.answer("У тебя нет питомцев. Создай через /start")
+            return
+        lines = ["🐾 <b>Твои питомцы:</b>\n"]
+        for m in members[:10]:
+            p = m.get("pets") or {}
+            lvl = min(30, (p.get("xp") or 0) // 50 + 1)
+            lines.append(f"• <b>{p['name']}</b> · ур. {lvl}\n  <code>/pet {p['name']}</code>")
+        await message.answer("\n".join(lines), parse_mode="HTML")
+        return
+
+    name_query = args[0].strip()
+    action_key = args[1].lower() if len(args) > 1 else None
+
+    pet = None
+    members = many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
+
+    if len(name_query) >= 30 and "-" in name_query:
+        candidate = one(sb.table("pets").select("*").eq("id", name_query))
+        if candidate:
+            ok = one(sb.table("members").select("*").eq("pet_id", candidate["id"]).eq("user_id", user.id))
+            if ok: pet = candidate
+    else:
+        nq = name_query.lower()
+        for m in members:
+            p = m.get("pets") or {}
+            if (p.get("name") or "").lower() == nq:
+                pet = p; break
+        if not pet:
+            for m in members:
+                p = m.get("pets") or {}
+                if nq in (p.get("name") or "").lower():
+                    pet = p; break
+
+    if not pet:
+        await message.answer(f"🐾 Питомец «{escape_html(name_query)}» не найден среди твоих. Список: /pet")
+        return
+
+    if not action_key:
+        await _send_pet_info(message, pet)
+        return
+
+    action = PET_ALIASES.get(action_key)
+    if action == "info":
+        await _send_pet_info(message, pet)
+        return
+    if not action:
+        await message.answer(
+            f"Не понимаю действие «{escape_html(action_key)}».\n\n"
+            f"<b>Что можно:</b> покормить · погладить · играть · помыть · лечить\n"
+            f"Например: <code>/pet {escape_html(pet['name'])} покормить</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    cfg = PET_ACTIONS[action]
+    user_id = user.id
+
+    pet = one(sb.table("pets").select("*").eq("id", pet["id"]))
+    if not pet:
+        await message.answer("Питомец не найден"); return
+    pet = save_pet_tick(pet)
+
+    mem = one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", user_id))
+    if not mem:
+        await message.answer("Ты не участник этого питомца. Открой ссылку-приглашение.")
+        return
+
+    last_key = "last_" + action + "_at"
+    last_str = mem.get(last_key)
+    if last_str:
+        try:
+            last_dt = datetime.fromisoformat(last_str.replace("Z","+00:00"))
+            passed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+            if passed < cfg["cd"]:
+                left = int(cfg["cd"] - passed)
+                mm, ss = left // 60, left % 60
+                t = f"{mm} мин {ss} сек" if mm else f"{ss} сек"
+                await message.answer(f"⌛ {escape_html(user.first_name or 'Гость')}, ещё рано. Подожди {t}.")
+                return
+        except Exception: pass
+
+    score = mem.get("score") or 0
+    if cfg.get("cost") and score < cfg["cost"]:
+        await message.answer(f"❌ Не хватает очков: нужно {cfg['cost']}, у тебя {score}.")
+        return
+
+    new_pet = dict(pet)
+    for k, v in cfg["effects"].items():
+        old = new_pet.get(k) or 0
+        new_pet[k] = max(0, min(100, old + v))
+    new_pet["xp"] = (pet.get("xp") or 0) + cfg["xp"]
+
+    old_lvl = min(30, (pet.get("xp") or 0) // 50 + 1)
+    new_lvl = min(30, new_pet["xp"] // 50 + 1)
+    old_st = _stage_idx(old_lvl); new_st = _stage_idx(new_lvl)
+
+    sb.table("pets").update({
+        "hunger": new_pet["hunger"], "mood": new_pet["mood"],
+        "energy": new_pet["energy"], "clean": new_pet["clean"],
+        "health": new_pet["health"], "xp": new_pet["xp"],
+        "last_tick_at": new_pet["last_tick_at"],
+    }).eq("id", pet["id"]).execute()
+
+    iso_now = datetime.now(timezone.utc).isoformat()
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    new_score = score + cfg["score"]
+    member_upd = {"score": new_score, last_key: iso_now}
+    if mem.get("today_date") == today_iso:
+        member_upd["today_score"] = (mem.get("today_score") or 0) + max(cfg["score"], 0)
+    else:
+        member_upd["today_score"] = max(cfg["score"], 0)
+        member_upd["today_date"] = today_iso
+    sb.table("members").update(member_upd).eq("pet_id", pet["id"]).eq("user_id", user_id).execute()
+
+    try:
+        sb.table("events").insert({
+            "pet_id": pet["id"], "user_id": user_id,
+            "first_name": user.first_name or "Гость",
+            "action": action,
+        }).execute()
+    except Exception: pass
+
+    uname = escape_html(user.first_name or "Кто-то")
+    changed = []
+    for k, v in cfg["effects"].items():
+        label = {"hunger":"сытость","mood":"настроение","energy":"энергия",
+                 "clean":"чистота","health":"здоровье"}.get(k, k)
+        sign = "+" if v > 0 else "−"
+        changed.append(f"{label} {sign}{abs(v)}")
+
+    text = f"{cfg['emoji']} <b>{uname}</b> — {cfg['label'].lower()} <b>{escape_html(pet['name'])}</b>"
+    if changed:
+        text += "\n  " + " · ".join(changed)
+
+    if new_st > old_st:
+        names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
+        text += f"\n\n✨ <b>Эволюция!</b> {escape_html(pet['name'])} теперь <b>{names[new_st]}</b>"
+
+    await message.answer(text, parse_mode="HTML")
+
+
 # ============ АДМИНКА ============
 
 @dp.message(Command("admin"))
@@ -465,9 +720,6 @@ async def cmd_admin(m: Message):
         "<b>Мои питомцы:</b>\n"
         "/my_pets_admin — мои питомцы с ID\n"
         "/list_pets — все питомцы бота\n\n"
-        "<b>Все команды работают двумя способами:</b>\n"
-        "<code>/cmd classic</code> — если 1 питомец\n"
-        "<code>/cmd &lt;pet_id&gt; classic</code> — точный выбор\n\n"
         "<b>Очки:</b>\n"
         "/addscore [pet_id] 100 — себе\n"
         "/addscore_user [pet_id] &lt;uid&gt; 100 — юзеру\n"
@@ -477,8 +729,8 @@ async def cmd_admin(m: Message):
         "/addxp [pet_id] 200 — добавить\n"
         "/setxp [pet_id] 1000 — установить\n\n"
         "<b>Баланс:</b>\n"
-        "/setbal [pet_id] 5 — установить\n"
-        "/addbal [pet_id] 1 — добавить\n\n"
+        "/setbal [pet_id] 5\n"
+        "/addbal [pet_id] 1\n\n"
         "<b>Скин:</b>\n"
         "/setskin [pet_id] classic|cat|dragon|space|dino\n\n"
         "<b>Прочее:</b>\n"
@@ -521,8 +773,6 @@ async def cmd_list_pets(m: Message):
         )
     await m.answer("\n".join(lines), parse_mode="HTML")
 
-
-# ---------- ОЧКИ ----------
 
 @dp.message(Command("addscore"))
 async def cmd_addscore(m: Message):
@@ -578,8 +828,6 @@ async def cmd_setscore_user(m: Message):
         parse_mode="HTML")
 
 
-# ---------- XP ----------
-
 @dp.message(Command("xp"))
 async def cmd_xp(m: Message):
     if not is_admin(m.from_user.id): return
@@ -588,12 +836,12 @@ async def cmd_xp(m: Message):
     if not pet: return
     xp = pet.get("xp") or 0
     lvl = min(30, xp // 50 + 1)
-    sidx = 4 if lvl>=25 else 3 if lvl>=17 else 2 if lvl>=10 else 1 if lvl>=5 else 0
-    sname = ["🥚 Яйцо","🐣 Птенец","🐥 Юнец","🐓 Взрослый","🦅 Старейшина"][sidx]
+    sidx = _stage_idx(lvl)
+    names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
     await m.answer(
         f"📊 <b>Статистика</b>\n{pet_line(pet)}\n"
         f"XP: <b>{xp}</b>\nУр.: <b>{lvl}</b>/30\n"
-        f"Стадия: {sname}\nДо след.: {50 - (xp % 50)} XP",
+        f"Стадия: {names[sidx]}\nДо след.: {50 - (xp % 50)} XP",
         parse_mode="HTML")
 
 
@@ -627,16 +875,14 @@ async def _apply_xp(pet, amount, message, mode):
     if nx < 0: nx = 0
     sb.table("pets").update({"xp": nx}).eq("id", pet["id"]).execute()
     def lvl(x): return min(30, x // 50 + 1)
-    def st(l): return 4 if l>=25 else 3 if l>=17 else 2 if l>=10 else 1 if l>=5 else 0
-    ol, nl = lvl(ox), lvl(nx); os, ns = st(ol), st(nl)
-    names = ["🥚","🐣","🐥","🐓","🦅"]
+    ol, nl = lvl(ox), lvl(nx)
+    os_, ns_ = _stage_idx(ol), _stage_idx(nl)
+    names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
     text = (f"✅ <b>XP {'установлен' if mode=='set' else 'добавлен'}</b>\n{pet_line(pet)}\n\n"
             f"XP: {ox} → <b>{nx}</b>\nУр.: {ol} → <b>{nl}</b>")
-    if ns != os: text += f"\n✨ <b>Эволюция!</b> {names[os]} → {names[ns]}"
+    if ns_ != os_: text += f"\n✨ <b>Эволюция!</b> {names[os_]} → {names[ns_]}"
     await message.answer(text, parse_mode="HTML")
 
-
-# ---------- БАЛАНС ----------
 
 @dp.message(Command("setbal"))
 async def cmd_setbal(m: Message):
@@ -665,8 +911,6 @@ async def cmd_addbal(m: Message):
     await m.answer(f"✅ <b>Баланс: {nb:.4f} USDT</b>\n{pet_line(pet)}", parse_mode="HTML")
 
 
-# ---------- СКИН ----------
-
 @dp.message(Command("setskin"))
 async def cmd_setskin(m: Message):
     if not is_admin(m.from_user.id): return
@@ -682,7 +926,29 @@ async def cmd_setskin(m: Message):
     await m.answer(f"✅ <b>Скин: {skin}</b>\n{pet_line(pet)}", parse_mode="HTML")
 
 
-# ---------- ЧЕКИ ----------
+@dp.message(Command("reset_scores"))
+async def cmd_reset_scores(m: Message):
+    if not is_admin(m.from_user.id): return
+    today = date.today().isoformat()
+    sb.table("members").update({"today_score": 0, "today_date": today}).neq("user_id", 0).execute()
+    await m.answer("✅ Дневные очки обнулены у всех.")
+
+
+@dp.message(Command("xr"))
+async def cmd_xr(m: Message):
+    if not is_admin(m.from_user.id): return
+    await m.answer("🔍 Проверяю xRocket…")
+    bal = await get_app_balance(); ch = await list_xrocket_cheques()
+    lines = ["<b>📊 xRocket</b>\n"]
+    if bal:
+        lines.append(f"✅ {bal['path']}")
+        lines.append(f"<pre>{str(bal['data'])[:400]}</pre>")
+    else: lines.append("❌ Не получил баланс.")
+    lines.append(f"\n🧾 Чеков: {len(ch)}")
+    for c in ch[:10]:
+        lines.append(f"• <code>{c.get('chequeId') or c.get('id')}</code> — {c.get('amount','?')}")
+    await m.answer("\n".join(lines), parse_mode="HTML")
+
 
 @dp.message(Command("cheques"))
 async def cmd_cheques(m: Message):
@@ -741,30 +1007,6 @@ async def cmd_cancel_cheques(m: Message):
         parse_mode="HTML")
 
 
-@dp.message(Command("reset_scores"))
-async def cmd_reset_scores(m: Message):
-    if not is_admin(m.from_user.id): return
-    today = date.today().isoformat()
-    sb.table("members").update({"today_score": 0, "today_date": today}).neq("user_id", 0).execute()
-    await m.answer("✅ Дневные очки обнулены у всех.")
-
-
-@dp.message(Command("xr"))
-async def cmd_xr(m: Message):
-    if not is_admin(m.from_user.id): return
-    await m.answer("🔍 Проверяю xRocket…")
-    bal = await get_app_balance(); ch = await list_xrocket_cheques()
-    lines = ["<b>📊 xRocket</b>\n"]
-    if bal:
-        lines.append(f"✅ {bal['path']}")
-        lines.append(f"<pre>{str(bal['data'])[:400]}</pre>")
-    else: lines.append("❌ Не получил баланс.")
-    lines.append(f"\n🧾 Чеков: {len(ch)}")
-    for c in ch[:10]:
-        lines.append(f"• <code>{c.get('chequeId') or c.get('id')}</code> — {c.get('amount','?')}")
-    await m.answer("\n".join(lines), parse_mode="HTML")
-
-
 # ============ create / my_pets ============
 
 @dp.callback_query(F.data == "create")
@@ -814,7 +1056,16 @@ async def cb_my_pets(call: CallbackQuery):
 
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
-    await m.answer("🐾 /start чтобы начать.")
+    await m.answer(
+        "🐾 <b>Игра про общего питомца</b>\n\n"
+        "• /start — создать питомца\n"
+        "• /pet — мои питомцы\n"
+        "• /pet имя покормить — покормить питомца\n"
+        "• /pet имя погладить — погладить\n"
+        "• /pet имя играть — поиграть\n"
+        "• /pet имя помыть — помыть\n"
+        "• /pet имя лечить — полечить (30 очков)",
+        parse_mode="HTML")
 
 
 # ============ health + webhook ============
@@ -845,6 +1096,8 @@ async def xrocket_webhook(request: web.Request):
     return web.json_response({"ok": True})
 
 
+# ============ запуск ============
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", health)
@@ -860,7 +1113,7 @@ async def start_web_server():
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
-    log.info("🤖 @%s стартовал", me.username)
+    log.info("🤖 @%s стартовал (admins: %s)", me.username, ADMIN_IDS)
     await start_web_server()
     await dp.start_polling(bot)
 
