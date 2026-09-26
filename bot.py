@@ -11,7 +11,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, InlineKeyboardButton,
     WebAppInfo
 )
-from supabase import create_client, Client
+from supabase import create_async_client, AsyncClient
 from aiohttp import web
 import aiohttp
 
@@ -40,7 +40,7 @@ SKINS = ["classic", "cat", "dragon", "space", "dino"]
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
-sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+sb: AsyncClient = None  # инициализируется в main()
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
@@ -70,35 +70,37 @@ def pick_link(obj):
     return None
 
 
-def one(q):
+async def one(q):
     try:
-        r = q.limit(1).execute(); d = getattr(r,"data",None) or []
+        r = await q.limit(1).execute()
+        d = getattr(r, "data", None) or []
         return d[0] if d else None
     except Exception as e:
         log.warning("one(): %s", e); return None
 
 
-def many(q):
+async def many(q):
     try:
-        r = q.execute(); return getattr(r,"data",None) or []
+        r = await q.execute()
+        return getattr(r, "data", None) or []
     except Exception as e:
         log.warning("many(): %s", e); return []
 
 
-def my_pets(uid):
-    return many(sb.table("pets").select("*").eq("owner_id", uid))
+async def my_pets(uid):
+    return await many(sb.table("pets").select("*").eq("owner_id", uid))
 
 
 async def resolve_pet(message: Message, args: list):
     if args and is_uuid(args[0].strip()):
         pid = args[0].strip()
-        pet = one(sb.table("pets").select("*").eq("id", pid))
+        pet = await one(sb.table("pets").select("*").eq("id", pid))
         if not pet:
             await message.answer(f"❌ Питомец <code>{pid}</code> не найден.", parse_mode="HTML")
             return None, None
         return pet, args[1:]
 
-    pets = my_pets(message.from_user.id)
+    pets = await my_pets(message.from_user.id)
     if not pets:
         await message.answer("❌ У тебя нет питомцев.")
         return None, None
@@ -198,10 +200,10 @@ async def cmd_start(message: Message):
 
     if payload.startswith("join_"):
         code = payload[5:]
-        pet = one(sb.table("pets").select("*").eq("invite_code", code))
+        pet = await one(sb.table("pets").select("*").eq("invite_code", code))
         if not pet:
             await message.answer("Питомец не найден."); return
-        sb.table("members").upsert({
+        await sb.table("members").upsert({
             "pet_id": pet["id"], "user_id": user.id,
             "first_name": user.first_name or "Гость", "username": user.username,
         }, on_conflict="pet_id,user_id").execute()
@@ -220,7 +222,7 @@ async def cmd_start(message: Message):
         amount = cents / 100.0
         if amount <= 0 or amount > 1000:
             await message.answer("Некорректная сумма."); return
-        pet = one(sb.table("pets").select("*").eq("id", pet_id))
+        pet = await one(sb.table("pets").select("*").eq("id", pet_id))
         if not pet or pet["owner_id"] != user.id:
             await message.answer("❌ Только владелец."); return
         await message.answer(f"💳 Создаю счёт на {amount} USDT…\n{pet_line(pet)}", parse_mode="HTML")
@@ -232,7 +234,7 @@ async def cmd_start(message: Message):
         link = pick_link(inv); iid = inv.get("id") or inv.get("invoiceId")
         if not link or not iid:
             await message.answer("⚠️ Нет ссылки."); return
-        sb.table("invoices").insert({
+        await sb.table("invoices").insert({
             "invoice_id": str(iid), "pet_id": pet_id, "owner_id": user.id,
             "amount": amount, "currency": pet.get("currency","USDT"), "status": "pending",
         }).execute()
@@ -270,7 +272,7 @@ async def cmd_start(message: Message):
 @dp.callback_query(F.data.startswith("check_"))
 async def cb_check_payment(call: CallbackQuery):
     iid = call.data[6:]; user = call.from_user
-    inv = one(sb.table("invoices").select("*").eq("invoice_id", iid))
+    inv = await one(sb.table("invoices").select("*").eq("invoice_id", iid))
     if not inv or inv["owner_id"] != user.id:
         await call.answer("Нет доступа", show_alert=True); return
     if inv["status"] == "paid":
@@ -282,11 +284,11 @@ async def cb_check_payment(call: CallbackQuery):
         await call.answer(f"xRocket: {(d.get('detail') or str(e))[:180]}", show_alert=True); return
     status = (st.get("status") or st.get("state") or (st.get("invoice") or {}).get("status") or "").lower()
     if status in ("paid","success","completed","paid_success"):
-        pet = one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
+        pet = await one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
         if pet:
             nb = float(pet.get("bank_balance") or 0) + float(inv["amount"])
-            sb.table("pets").update({"bank_balance": nb}).eq("id", inv["pet_id"]).execute()
-            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", iid).execute()
+            await sb.table("pets").update({"bank_balance": nb}).eq("id", inv["pet_id"]).execute()
+            await sb.table("invoices").update({"status": "paid"}).eq("invoice_id", iid).execute()
             await call.answer("Оплачено! ✅", show_alert=True)
             try:
                 await call.message.edit_text(
@@ -302,7 +304,7 @@ async def cb_check_payment(call: CallbackQuery):
 
 @dp.message(Command("balance"))
 async def cmd_balance(m: Message):
-    pets = my_pets(m.from_user.id)
+    pets = await my_pets(m.from_user.id)
     if not pets:
         await m.answer("Нет питомцев."); return
     lines = ["🏦 <b>Балансы:</b>\n"]
@@ -336,7 +338,7 @@ async def cmd_topup(m: Message):
     link = pick_link(inv); iid = inv.get("id") or inv.get("invoiceId")
     if not link or not iid:
         await m.answer("⚠️ Нет ссылки."); return
-    sb.table("invoices").insert({
+    await sb.table("invoices").insert({
         "invoice_id": str(iid), "pet_id": pet["id"], "owner_id": user.id,
         "amount": amount, "currency": pet.get("currency","USDT"), "status": "pending",
     }).execute()
@@ -368,7 +370,7 @@ async def cmd_salary(m: Message):
 
 
 async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
-    pet = one(sb.table("pets").select("*").eq("id", pet_id))
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
     if not pet:
         await message.answer("Питомец не найден."); return
     if pet["owner_id"] != owner_id:
@@ -382,10 +384,10 @@ async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
         await message.answer(f"В банке только {balance:.4f}."); return
 
     today = date.today().isoformat()
-    members = many(sb.table("members").select("*").eq("pet_id", pet["id"]))
+    members = await many(sb.table("members").select("*").eq("pet_id", pet["id"]))
     for m in members:
         if m.get("today_date") != today:
-            sb.table("members").update({"today_score": 0, "today_date": today})\
+            await sb.table("members").update({"today_score": 0, "today_date": today})\
               .eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
             m["today_score"] = 0
     active = [m for m in members if (m.get("today_score") or 0) > 0]
@@ -401,8 +403,8 @@ async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
     if min_share < MIN_CHEQUE:
         await message.answer(f"❌ Слишком мелкие чеки ({min_share:.4f})."); return
 
-    sb.table("pets").update({"bank_balance": balance - amount}).eq("id", pet["id"]).execute()
-    po = sb.table("payouts").insert({
+    await sb.table("pets").update({"bank_balance": balance - amount}).eq("id", pet["id"]).execute()
+    po = await sb.table("payouts").insert({
         "pet_id": pet["id"], "owner_id": owner_id, "total_amount": amount,
         "currency": pet.get("currency","USDT"), "member_count": len(winners)}).execute()
     payout = po.data[0]
@@ -423,7 +425,7 @@ async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
             d = getattr(e,"data",None) or {}
             failed_msg = d.get("detail") or d.get("title") or str(e); break
         cid = ch.get("chequeId") or ch.get("id"); link = pick_link(ch)
-        sb.table("cheques").insert({
+        await sb.table("cheques").insert({
             "payout_id": payout["id"], "pet_id": pet["id"], "user_id": m["user_id"],
             "amount": share, "cheque_id": cid, "cheque_link": link,
             "status": "sent" if link else "no_link"}).execute()
@@ -441,14 +443,14 @@ async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
         sent += 1; total_sent += share; paid.append(m["user_id"])
     refund = round(amount - total_sent, 6)
     if refund > 0:
-        pn = one(sb.table("pets").select("*").eq("id", pet["id"]))
+        pn = await one(sb.table("pets").select("*").eq("id", pet["id"]))
         cb = float(pn.get("bank_balance") or 0)
-        sb.table("pets").update({"bank_balance": cb + refund}).eq("id", pet["id"]).execute()
+        await sb.table("pets").update({"bank_balance": cb + refund}).eq("id", pet["id"]).execute()
     for m in winners:
         if m["user_id"] in paid:
-            sb.table("members").update({"today_score": 0, "today_date": today})\
+            await sb.table("members").update({"today_score": 0, "today_date": today})\
               .eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
-    pn = one(sb.table("pets").select("*").eq("id", pet["id"]))
+    pn = await one(sb.table("pets").select("*").eq("id", pet["id"]))
     final = float(pn.get("bank_balance") or 0)
     text = (f"✅ <b>Выплата</b>\n{pet_line(pet)}\n"
             f"Раздано: {total_sent:.4f} из {amount:.4f}\n"
@@ -527,10 +529,10 @@ def apply_pet_tick(pet):
     return c
 
 
-def save_pet_tick(pet):
+async def save_pet_tick(pet):
     ticked = apply_pet_tick(pet)
     if ticked.get("last_tick_at") != pet.get("last_tick_at"):
-        sb.table("pets").update({
+        await sb.table("pets").update({
             "hunger": ticked["hunger"], "mood": ticked["mood"],
             "energy": ticked["energy"], "clean": ticked["clean"],
             "health": ticked["health"], "last_tick_at": ticked["last_tick_at"],
@@ -539,7 +541,7 @@ def save_pet_tick(pet):
 
 
 async def _send_pet_info(message, pet):
-    pet = save_pet_tick(pet)
+    pet = await save_pet_tick(pet)
     lvl = min(30, (pet.get("xp") or 0) // 50 + 1)
     st = _stage_idx(lvl)
     names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
@@ -567,7 +569,7 @@ async def cmd_pet(message: Message):
     args = parts[1:] if len(parts) > 1 else []
 
     if not args:
-        members = many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
+        members = await many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
         if not members:
             await message.answer("У тебя нет питомцев. Создай через /start")
             return
@@ -583,12 +585,12 @@ async def cmd_pet(message: Message):
     action_key = args[1].lower() if len(args) > 1 else None
 
     pet = None
-    members = many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
+    members = await many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
 
     if len(name_query) >= 30 and "-" in name_query:
-        candidate = one(sb.table("pets").select("*").eq("id", name_query))
+        candidate = await one(sb.table("pets").select("*").eq("id", name_query))
         if candidate:
-            ok = one(sb.table("members").select("*").eq("pet_id", candidate["id"]).eq("user_id", user.id))
+            ok = await one(sb.table("members").select("*").eq("pet_id", candidate["id"]).eq("user_id", user.id))
             if ok: pet = candidate
     else:
         nq = name_query.lower()
@@ -626,12 +628,12 @@ async def cmd_pet(message: Message):
     cfg = PET_ACTIONS[action]
     user_id = user.id
 
-    pet = one(sb.table("pets").select("*").eq("id", pet["id"]))
+    pet = await one(sb.table("pets").select("*").eq("id", pet["id"]))
     if not pet:
         await message.answer("Питомец не найден"); return
-    pet = save_pet_tick(pet)
+    pet = await save_pet_tick(pet)
 
-    mem = one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", user_id))
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", user_id))
     if not mem:
         await message.answer("Ты не участник этого питомца. Открой ссылку-приглашение.")
         return
@@ -665,7 +667,7 @@ async def cmd_pet(message: Message):
     new_lvl = min(30, new_pet["xp"] // 50 + 1)
     old_st = _stage_idx(old_lvl); new_st = _stage_idx(new_lvl)
 
-    sb.table("pets").update({
+    await sb.table("pets").update({
         "hunger": new_pet["hunger"], "mood": new_pet["mood"],
         "energy": new_pet["energy"], "clean": new_pet["clean"],
         "health": new_pet["health"], "xp": new_pet["xp"],
@@ -681,10 +683,10 @@ async def cmd_pet(message: Message):
     else:
         member_upd["today_score"] = max(cfg["score"], 0)
         member_upd["today_date"] = today_iso
-    sb.table("members").update(member_upd).eq("pet_id", pet["id"]).eq("user_id", user_id).execute()
+    await sb.table("members").update(member_upd).eq("pet_id", pet["id"]).eq("user_id", user_id).execute()
 
     try:
-        sb.table("events").insert({
+        await sb.table("events").insert({
             "pet_id": pet["id"], "user_id": user_id,
             "first_name": user.first_name or "Гость",
             "action": action,
@@ -744,7 +746,7 @@ async def cmd_admin(m: Message):
 @dp.message(Command("my_pets_admin"))
 async def cmd_my_pets_admin(m: Message):
     if not is_admin(m.from_user.id): return
-    pets = my_pets(m.from_user.id)
+    pets = await my_pets(m.from_user.id)
     if not pets: await m.answer("Нет питомцев."); return
     lines = ["🐾 <b>Твои питомцы:</b>\n"]
     for p in pets:
@@ -760,7 +762,7 @@ async def cmd_my_pets_admin(m: Message):
 @dp.message(Command("list_pets"))
 async def cmd_list_pets(m: Message):
     if not is_admin(m.from_user.id): return
-    pets = many(sb.table("pets").select("id,name,owner_id,bank_balance,xp,skin"))
+    pets = await many(sb.table("pets").select("id,name,owner_id,bank_balance,xp,skin"))
     if not pets: await m.answer("Нет питомцев."); return
     lines = ["🌍 <b>Все питомцы бота:</b>\n"]
     for p in pets[:40]:
@@ -784,10 +786,10 @@ async def cmd_addscore(m: Message):
         await m.answer("Формат: /addscore [pet_id] 100"); return
     try: amount = int(rest[0])
     except: await m.answer("Не число."); return
-    mem = one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", m.from_user.id))
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", m.from_user.id))
     if not mem: await m.answer("Ты не участник."); return
     ns = (mem.get("score") or 0) + amount
-    sb.table("members").update({"score": ns}).eq("pet_id", pet["id"]).eq("user_id", m.from_user.id).execute()
+    await sb.table("members").update({"score": ns}).eq("pet_id", pet["id"]).eq("user_id", m.from_user.id).execute()
     await m.answer(
         f"✅ <b>Очки: {mem.get('score') or 0} → {ns}</b>\n{pet_line(pet)}",
         parse_mode="HTML")
@@ -803,10 +805,10 @@ async def cmd_addscore_user(m: Message):
         await m.answer("Формат: /addscore_user [pet_id] <uid> 100"); return
     try: uid = int(rest[0]); amount = int(rest[1])
     except: await m.answer("Не числа."); return
-    mem = one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", uid))
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", uid))
     if not mem: await m.answer(f"Юзер <code>{uid}</code> не участник.", parse_mode="HTML"); return
     ns = (mem.get("score") or 0) + amount
-    sb.table("members").update({"score": ns}).eq("pet_id", pet["id"]).eq("user_id", uid).execute()
+    await sb.table("members").update({"score": ns}).eq("pet_id", pet["id"]).eq("user_id", uid).execute()
     await m.answer(
         f"✅ <b>Очки юзера {uid}: {mem.get('score') or 0} → {ns}</b>\n{pet_line(pet)}",
         parse_mode="HTML")
@@ -822,7 +824,7 @@ async def cmd_setscore_user(m: Message):
         await m.answer("Формат: /setscore_user [pet_id] <uid> 100"); return
     try: uid = int(rest[0]); amount = int(rest[1])
     except: await m.answer("Не числа."); return
-    sb.table("members").update({"score": amount}).eq("pet_id", pet["id"]).eq("user_id", uid).execute()
+    await sb.table("members").update({"score": amount}).eq("pet_id", pet["id"]).eq("user_id", uid).execute()
     await m.answer(
         f"✅ <b>Очки юзера {uid} = {amount}</b>\n{pet_line(pet)}",
         parse_mode="HTML")
@@ -873,7 +875,7 @@ async def _apply_xp(pet, amount, message, mode):
     ox = pet.get("xp") or 0
     nx = amount if mode == "set" else ox + amount
     if nx < 0: nx = 0
-    sb.table("pets").update({"xp": nx}).eq("id", pet["id"]).execute()
+    await sb.table("pets").update({"xp": nx}).eq("id", pet["id"]).execute()
     def lvl(x): return min(30, x // 50 + 1)
     ol, nl = lvl(ox), lvl(nx)
     os_, ns_ = _stage_idx(ol), _stage_idx(nl)
@@ -893,7 +895,7 @@ async def cmd_setbal(m: Message):
     if not rest: await m.answer("Формат: /setbal [pet_id] 5"); return
     try: amount = float(rest[0].replace(",","."))
     except: await m.answer("Не разобрать."); return
-    sb.table("pets").update({"bank_balance": amount}).eq("id", pet["id"]).execute()
+    await sb.table("pets").update({"bank_balance": amount}).eq("id", pet["id"]).execute()
     await m.answer(f"✅ <b>Баланс: {amount:.4f} USDT</b>\n{pet_line(pet)}", parse_mode="HTML")
 
 
@@ -907,7 +909,7 @@ async def cmd_addbal(m: Message):
     try: amount = float(rest[0].replace(",","."))
     except: await m.answer("Не разобрать."); return
     nb = float(pet.get("bank_balance") or 0) + amount
-    sb.table("pets").update({"bank_balance": nb}).eq("id", pet["id"]).execute()
+    await sb.table("pets").update({"bank_balance": nb}).eq("id", pet["id"]).execute()
     await m.answer(f"✅ <b>Баланс: {nb:.4f} USDT</b>\n{pet_line(pet)}", parse_mode="HTML")
 
 
@@ -922,7 +924,7 @@ async def cmd_setskin(m: Message):
     skin = rest[0].lower()
     if skin not in SKINS:
         await m.answer(f"Доступные: {', '.join(SKINS)}"); return
-    sb.table("pets").update({"skin": skin}).eq("id", pet["id"]).execute()
+    await sb.table("pets").update({"skin": skin}).eq("id", pet["id"]).execute()
     await m.answer(f"✅ <b>Скин: {skin}</b>\n{pet_line(pet)}", parse_mode="HTML")
 
 
@@ -930,7 +932,7 @@ async def cmd_setskin(m: Message):
 async def cmd_reset_scores(m: Message):
     if not is_admin(m.from_user.id): return
     today = date.today().isoformat()
-    sb.table("members").update({"today_score": 0, "today_date": today}).neq("user_id", 0).execute()
+    await sb.table("members").update({"today_score": 0, "today_date": today}).neq("user_id", 0).execute()
     await m.answer("✅ Дневные очки обнулены у всех.")
 
 
@@ -961,12 +963,12 @@ async def cmd_cheques(m: Message):
 
     pet, _ = await resolve_pet(m, args) if args else (None, None)
     if pet:
-        db = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
+        db = await many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
         lines.append(f"\n<b>{pet['name']}</b>: {len(db)} в БД")
     else:
-        pets = my_pets(m.from_user.id)
+        pets = await my_pets(m.from_user.id)
         for p in pets[:5]:
-            db = many(sb.table("cheques").select("*").eq("pet_id", p["id"]).eq("status","sent"))
+            db = await many(sb.table("cheques").select("*").eq("pet_id", p["id"]).eq("status","sent"))
             lines.append(f"\n<b>{p['name']}</b>: {len(db)}")
     lines.append("\n/cancel_cheques [pet_id] — отменить")
     await m.answer("\n".join(lines), parse_mode="HTML")
@@ -980,7 +982,7 @@ async def cmd_cancel_cheques(m: Message):
     if not pet: return
 
     xr = await list_xrocket_cheques()
-    db = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
+    db = await many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
     ids = {}
     for c in xr:
         cid = c.get("chequeId") or c.get("id")
@@ -996,12 +998,12 @@ async def cmd_cancel_cheques(m: Message):
         try:
             await delete_cheque(cid); ok += 1
             refund += float(info.get("amount") or 0)
-            sb.table("cheques").update({"status": "cancelled"}).eq("cheque_id", cid).execute()
+            await sb.table("cheques").update({"status": "cancelled"}).eq("cheque_id", cid).execute()
         except: fail += 1
     if refund > 0:
-        pn = one(sb.table("pets").select("*").eq("id", pet["id"]))
+        pn = await one(sb.table("pets").select("*").eq("id", pet["id"]))
         cb = float(pn.get("bank_balance") or 0)
-        sb.table("pets").update({"bank_balance": round(cb + refund, 6)}).eq("id", pet["id"]).execute()
+        await sb.table("pets").update({"bank_balance": round(cb + refund, 6)}).eq("id", pet["id"]).execute()
     await m.answer(
         f"✅ Отменено: {ok}\nОшибок: {fail}\nВозвращено: {refund:.4f} USDT\n{pet_line(pet)}",
         parse_mode="HTML")
@@ -1015,12 +1017,12 @@ async def cb_create(call: CallbackQuery):
     for _ in range(5):
         code = gen_code()
         try:
-            r = sb.table("pets").insert({"owner_id": user.id, "invite_code": code}).execute()
+            r = await sb.table("pets").insert({"owner_id": user.id, "invite_code": code}).execute()
             if r.data: pet = r.data[0]; break
         except Exception as e:
             if "23505" not in str(e): break
     if not pet: await call.answer("Ошибка.", show_alert=True); return
-    sb.table("members").insert({"pet_id": pet["id"], "user_id": user.id,
+    await sb.table("members").insert({"pet_id": pet["id"], "user_id": user.id,
         "first_name": user.first_name or "Гость", "username": user.username}).execute()
     await call.answer("Готово!")
     me = await bot.get_me()
@@ -1037,7 +1039,7 @@ async def cb_create(call: CallbackQuery):
 @dp.callback_query(F.data == "my_pets")
 async def cb_my_pets(call: CallbackQuery):
     await call.answer()
-    data = many(sb.table("members").select("pet_id, score, pets!inner(id, name, xp)")\
+    data = await many(sb.table("members").select("pet_id, score, pets!inner(id, name, xp)")\
                 .eq("user_id", call.from_user.id).order("score", desc=True).limit(20))
     if not data:
         await call.message.answer("Нет питомцев."); return
@@ -1080,14 +1082,14 @@ async def xrocket_webhook(request: web.Request):
     iid = data.get("invoiceId") or data.get("id") or (data.get("payload") or {}).get("invoiceId")
     status = (data.get("status") or data.get("type") or "").lower()
     if not iid: return web.json_response({"ok": True})
-    inv = one(sb.table("invoices").select("*").eq("invoice_id", str(iid)))
+    inv = await one(sb.table("invoices").select("*").eq("invoice_id", str(iid)))
     if not inv or inv["status"] == "paid": return web.json_response({"ok": True})
     if any(k in status for k in ("paid","success","completed","invoice_paid")):
-        pet = one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
+        pet = await one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
         if pet:
             nb = float(pet.get("bank_balance") or 0) + float(inv["amount"])
-            sb.table("pets").update({"bank_balance": nb}).eq("id", inv["pet_id"]).execute()
-            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", str(iid)).execute()
+            await sb.table("pets").update({"bank_balance": nb}).eq("id", inv["pet_id"]).execute()
+            await sb.table("invoices").update({"status": "paid"}).eq("invoice_id", str(iid)).execute()
             try:
                 await bot.send_message(inv["owner_id"],
                     f"✅ <b>Оплата получена</b>\n{pet_line(pet)}\nБаланс: <b>{nb:.4f} USDT</b>",
@@ -1111,6 +1113,10 @@ async def start_web_server():
 
 
 async def main():
+    global sb
+    sb = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
+    log.info("✅ Async Supabase подключён")
+
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     log.info("🤖 @%s стартовал (admins: %s)", me.username, ADMIN_IDS)
