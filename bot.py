@@ -2,7 +2,7 @@ import os
 import random
 import asyncio
 import logging
-from datetime import date
+from datetime import date, datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -28,196 +28,183 @@ PORT          = int(os.environ.get("PORT", 8080))
 
 ADMIN_IDS = {8130244626}
 MIN_CHEQUE = 0.01
+NOTIFY_COOLDOWN_HOURS = 3
+
+# Шаблоны ежедневных квестов
+QUEST_TEMPLATES = [
+    {"type": "feed_3",    "target": 3, "reward": 5,  "text": "Покормить 3 раза",     "emoji": "🍖"},
+    {"type": "pet_5",     "target": 5, "reward": 3,  "text": "Погладить 5 раз",       "emoji": "✋"},
+    {"type": "play_2",    "target": 2, "reward": 8,  "text": "Поиграть 2 раза",       "emoji": "🎾"},
+    {"type": "wash_1",    "target": 1, "reward": 5,  "text": "Помыть 1 раз",          "emoji": "🧼"},
+    {"type": "all_acts",  "target": 4, "reward": 15, "text": "Сделать 4 разных дела", "emoji": "🌟"},
+]
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def is_admin(uid): return uid in ADMIN_IDS
+def gen_code(n=6): return "".join(random.choice(CODE_CHARS) for _ in range(n))
+def webapp_url(pid): return f"{WEBAPP_URL}?pet={pid}"
+def escape_html(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 
-def gen_code(length: int = 6) -> str:
-    return "".join(random.choice(CODE_CHARS) for _ in range(length))
-
-
-def webapp_url(pet_id: str) -> str:
-    return f"{WEBAPP_URL}?pet={pet_id}"
-
-
-def pick_link(obj: dict) -> str | None:
-    if not obj or not isinstance(obj, dict):
-        return None
+def pick_link(obj):
+    if not obj or not isinstance(obj, dict): return None
     links = obj.get("links") or {}
     if isinstance(links, dict):
-        for key in ("telegramMiniAppLink", "telegramBotLink", "webLink", "link", "url"):
-            v = links.get(key)
-            if isinstance(v, str) and v.startswith("http"):
-                return v
-    for key in ("link", "url", "webLink", "telegramBotLink", "telegramMiniAppLink"):
-        v = obj.get(key)
-        if isinstance(v, str) and v.startswith("http"):
-            return v
+        for k in ("telegramMiniAppLink","telegramBotLink","webLink","link","url"):
+            v = links.get(k)
+            if isinstance(v, str) and v.startswith("http"): return v
+    for k in ("link","url","webLink","telegramBotLink","telegramMiniAppLink"):
+        v = obj.get(k)
+        if isinstance(v, str) and v.startswith("http"): return v
     return None
 
 
-def one(query):
+def one(q):
     try:
-        res = query.limit(1).execute()
-        data = getattr(res, "data", None) or []
-        if isinstance(data, list):
-            return data[0] if data else None
-        return data if data else None
+        r = q.limit(1).execute(); d = getattr(r,"data",None) or []
+        return d[0] if d else None
     except Exception as e:
-        log.warning("one() query failed: %s", e)
-        return None
+        log.warning("one(): %s", e); return None
 
 
-def many(query):
+def many(q):
     try:
-        res = query.execute()
-        return getattr(res, "data", None) or []
+        r = q.execute(); return getattr(r,"data",None) or []
     except Exception as e:
-        log.warning("many() query failed: %s", e)
-        return []
+        log.warning("many(): %s", e); return []
 
 
 # ============ xRocket ============
 
-async def xrocket_request(method: str, path: str, json: dict | None = None) -> dict:
+async def xrocket_request(method, path, json=None):
     url = f"{XROCKET_API}{path}"
-    headers = {
-        "Authorization": f"Bearer {XROCKET_TOKEN}",
-        "Content-Type": "application/json",
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.request(method, url, headers=headers, json=json, timeout=30) as resp:
-            raw = await resp.text()
-            try:
-                data = await resp.json() if raw else {}
-            except Exception:
-                data = {"raw": raw}
-            if resp.status >= 400:
-                log.error("xRocket error %s [%s %s]: %s", resp.status, method, path, data)
-                err = RuntimeError(f"xRocket {resp.status}: {data}")
-                err.status = resp.status
-                err.data = data
-                err.path = path
-                err.method = method
+    headers = {"Authorization": f"Bearer {XROCKET_TOKEN}", "Content-Type": "application/json"}
+    async with aiohttp.ClientSession() as s:
+        async with s.request(method, url, headers=headers, json=json, timeout=30) as r:
+            raw = await r.text()
+            try: data = await r.json() if raw else {}
+            except: data = {"raw": raw}
+            if r.status >= 400:
+                err = RuntimeError(f"xRocket {r.status}: {data}")
+                err.status = r.status; err.data = data; err.path = path; err.method = method
+                log.error("xRocket err %s %s: %s", method, path, data)
                 raise err
             return data
 
 
-async def create_invoice(amount: float, currency: str, description: str) -> dict:
-    payload = {
-        "priceAmount": str(amount),
-        "priceCurrency": currency,
-        "description": description,
-        "numPayments": 1,
-        "expiresIn": 3600000,
-    }
-    data = await xrocket_request("POST", "/api/v1/invoices", payload)
-    log.info("xRocket invoice response: %s", data)
+async def create_invoice(amount, currency, description):
+    data = await xrocket_request("POST", "/api/v1/invoices", {
+        "priceAmount": str(amount), "priceCurrency": currency,
+        "description": description, "numPayments": 1, "expiresIn": 3600000,
+    })
     return data
 
 
-async def get_invoice_status(invoice_id: str) -> dict:
-    return await xrocket_request("GET", f"/api/v1/invoices/{invoice_id}")
+async def get_invoice_status(iid):
+    return await xrocket_request("GET", f"/api/v1/invoices/{iid}")
 
 
-async def create_cheque(user_id: int, amount: float, currency: str, description: str) -> dict:
-    payload = {
-        "asset": currency,
-        "amount": str(amount),
-        "description": description,
-        "targetType": "telegram_user_id",
-        "target": str(user_id),
-    }
-    data = await xrocket_request("POST", "/api/v1/cheques", payload)
-    log.info("xRocket cheque response: %s", data)
+async def create_cheque(uid, amount, currency, description):
+    data = await xrocket_request("POST", "/api/v1/cheques", {
+        "asset": currency, "amount": str(amount), "description": description,
+        "targetType": "telegram_user_id", "target": str(uid),
+    })
     return data
 
 
-async def delete_cheque(cheque_id: str) -> dict:
-    try:
-        return await xrocket_request("DELETE", f"/api/v1/cheques/{cheque_id}")
+async def delete_cheque(cid):
+    try: return await xrocket_request("DELETE", f"/api/v1/cheques/{cid}")
     except Exception as e1:
-        status1 = getattr(e1, "status", None)
-        log.warning("delete path 1 failed (%s), trying path 2", status1)
-        try:
-            return await xrocket_request("DELETE", f"/api/v1/cheques?chequeId={cheque_id}")
-        except Exception as e2:
-            status2 = getattr(e2, "status", None)
-            log.warning("delete path 2 failed (%s), trying path 3", status2)
-            return await xrocket_request("POST", f"/api/v1/cheques/{cheque_id}/cancel")
+        if getattr(e1,"status",None) in (404,405):
+            try: return await xrocket_request("DELETE", f"/api/v1/cheques?chequeId={cid}")
+            except: return await xrocket_request("POST", f"/api/v1/cheques/{cid}/cancel")
+        raise
 
 
-async def list_xrocket_cheques() -> list[dict]:
-    paths = [
-        "/api/v1/cheques?status=active",
-        "/api/v1/cheques",
-        "/api/v1/cheques/my",
-    ]
-    for p in paths:
+async def list_xrocket_cheques():
+    for p in ("/api/v1/cheques?status=active", "/api/v1/cheques", "/api/v1/cheques/my"):
         try:
-            data = await xrocket_request("GET", p)
-            log.info("list_xrocket_cheques %s -> %s", p, str(data)[:300])
-            if isinstance(data, list):
-                return data
-            if isinstance(data, dict):
-                for key in ("cheques", "items", "results", "data"):
-                    if isinstance(data.get(key), list):
-                        return data[key]
-            return []
-        except Exception as e:
-            log.warning("list path %s failed: %s", p, getattr(e, "status", "?"))
-            continue
+            d = await xrocket_request("GET", p)
+            if isinstance(d, list): return d
+            if isinstance(d, dict):
+                for k in ("cheques","items","results","data"):
+                    if isinstance(d.get(k), list): return d[k]
+        except Exception: continue
     return []
 
 
-async def get_app_balance() -> dict | None:
-    paths = [
-        "/api/v1/app/balance",
-        "/api/v1/balance",
-        "/api/v1/me",
-    ]
-    for p in paths:
-        try:
-            data = await xrocket_request("GET", p)
-            log.info("get_app_balance %s -> %s", p, str(data)[:300])
-            return {"path": p, "data": data}
-        except Exception as e:
-            log.warning("balance path %s failed: %s", p, getattr(e, "status", "?"))
-            continue
+async def get_app_balance():
+    for p in ("/api/v1/app/balance", "/api/v1/balance", "/api/v1/me"):
+        try: return {"path": p, "data": await xrocket_request("GET", p)}
+        except Exception: continue
     return None
 
 
-def xrocket_error_text(e: Exception) -> str:
-    data = getattr(e, "data", None) or {}
-    kind = data.get("kind") or ""
-    title = data.get("title") or ""
-    detail = data.get("detail") or str(e)
-    path = getattr(e, "path", "")
-    status = getattr(e, "status", "?")
-
-    if "amount_more_than_app_balance" in str(data) or "more than app balance" in detail.lower():
-        return (
-            "⚠️ На балансе приложения xRocket недостаточно средств.\n\n"
-            "Пополни приложение: @xRocket → Wallet."
-        )
+def xrocket_error_text(e):
+    d = getattr(e,"data",None) or {}
+    kind = d.get("kind") or ""; title = d.get("title") or ""
+    detail = d.get("detail") or str(e)
+    if "amount_more_than_app_balance" in str(d) or "more than app balance" in detail.lower():
+        return "⚠️ На балансе приложения xRocket недостаточно средств. Пополни @xRocket → Wallet."
     if "operation_disabled" in kind or "disabled" in detail.lower():
-        return (
-            "⚠️ xRocket отключил эту операцию для твоего приложения.\n\n"
-            "Проверь Permissions / Operations в @xRocket → xRocket API → 302777."
-        )
-    if status == 404:
-        return f"⚠️ xRocket вернул 404 по пути {path}. Endpoint не найден."
-    if "forbidden" in kind:
-        return f"⚠️ xRocket запретил операцию: {detail}"
-    return f"⚠️ xRocket {status} {path}: {title or detail}"
+        return "⚠️ xRocket отключил эту операцию для твоего приложения. Проверь Permissions."
+    return f"⚠️ xRocket {getattr(e,'status','?')}: {title or detail}"
+
+
+# ============ КВЕСТЫ ============
+
+def ensure_quests(pet_id, user_id):
+    """Создаёт квесты на сегодня, если их ещё нет."""
+    today = date.today().isoformat()
+    existing = many(sb.table("quests").select("*")
+                    .eq("pet_id", pet_id).eq("user_id", user_id).eq("quest_date", today))
+    if existing: return existing
+    created = []
+    for t in QUEST_TEMPLATES:
+        r = sb.table("quests").insert({
+            "pet_id": pet_id, "user_id": user_id, "quest_date": today,
+            "quest_type": t["type"], "target": t["target"], "progress": 0,
+        }).execute()
+        if r.data: created.append(r.data[0])
+    return created
+
+
+def quest_action_type(action):
+    """Какое действие считаем для квеста."""
+    return {"feed":"feed_3", "pet":"pet_5", "play":"play_2", "wash":"wash_1"}.get(action)
+
+
+def quest_progress(pet_id, user_id, action):
+    """Обновляет прогресс квестов при действии. Вызывать после doAction."""
+    today = date.today().isoformat()
+    ensure_quests(pet_id, user_id)
+
+    # Инкремент для конкретного действия
+    qt = quest_action_type(action)
+    if qt:
+        q = one(sb.table("quests").select("*")
+                .eq("pet_id", pet_id).eq("user_id", user_id)
+                .eq("quest_date", today).eq("quest_type", qt))
+        if q and q["progress"] < q["target"]:
+            sb.table("quests").update({"progress": q["progress"] + 1}).eq("id", q["id"]).execute()
+
+    # all_acts — считаем уникальные действия за сегодня (по events)
+    acts = many(sb.table("events").select("action")
+                .eq("pet_id", pet_id).eq("user_id", user_id)
+                .gte("created_at", today + "T00:00:00"))
+    unique_acts = len({a["action"] for a in acts if a["action"] in ("feed","pet","play","wash")})
+    q_all = one(sb.table("quests").select("*")
+                .eq("pet_id", pet_id).eq("user_id", user_id)
+                .eq("quest_date", today).eq("quest_type", "all_acts"))
+    if q_all:
+        new_progress = min(unique_acts, q_all["target"])
+        if new_progress != q_all["progress"]:
+            sb.table("quests").update({"progress": new_progress}).eq("id", q_all["id"]).execute()
 
 
 # ============ /start ============
@@ -228,841 +215,631 @@ async def cmd_start(message: Message):
     if message.text and " " in message.text:
         payload = message.text.split(" ", 1)[1].strip()
     user = message.from_user
-    log.info("cmd_start payload=%r user=%s", payload, user.id)
+    log.info("cmd_start payload=%r uid=%s", payload, user.id)
 
     if payload.startswith("join_"):
         code = payload[5:]
         pet = one(sb.table("pets").select("*").eq("invite_code", code))
         if not pet:
-            await message.answer("Питомец не найден или ссылка устарела.")
-            return
+            await message.answer("Питомец не найден."); return
         sb.table("members").upsert({
             "pet_id": pet["id"], "user_id": user.id,
             "first_name": user.first_name or "Гость", "username": user.username,
         }, on_conflict="pet_id,user_id").execute()
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🐾 Открыть питомца",
-                                  web_app=WebAppInfo(url=webapp_url(pet["id"])))]
-        ])
-        await message.answer(f"🐾 Ты ухаживаешь за «{pet['name']}»!", reply_markup=kb)
-        return
+                                  web_app=WebAppInfo(url=webapp_url(pet["id"])))]])
+        await message.answer(f"🐾 Ты ухаживаешь за «{pet['name']}»!", reply_markup=kb); return
 
     if payload.startswith("topup_"):
         parts = payload[6:].split("_")
         pet_id = parts[0]
-        try:
-            cents = int(parts[1]) if len(parts) > 1 else 100
-        except ValueError:
-            cents = 100
+        try: cents = int(parts[1]) if len(parts) > 1 else 100
+        except: cents = 100
         amount = cents / 100.0
         if amount <= 0 or amount > 1000:
-            await message.answer("Некорректная сумма.")
-            return
-
+            await message.answer("Некорректная сумма."); return
         pet = one(sb.table("pets").select("*").eq("id", pet_id))
-        if not pet:
-            await message.answer("Питомец не найден.")
-            return
-        if pet["owner_id"] != user.id:
-            await message.answer("Только владелец может пополнять банк.")
-            return
-
-        await message.answer(f"💳 Создаю счёт на {amount} {pet.get('currency','USDT')}…")
+        if not pet or pet["owner_id"] != user.id:
+            await message.answer("Нет доступа."); return
+        await message.answer(f"💳 Создаю счёт на {amount}…")
         try:
-            invoice = await create_invoice(
-                amount=amount,
-                currency=pet.get("currency", "USDT"),
-                description=f"Пополнение банка питомца «{pet['name']}»"
-            )
+            inv = await create_invoice(amount, pet.get("currency","USDT"),
+                                       f"Банк питомца «{pet['name']}»")
         except Exception as e:
-            log.error("invoice failed: %s", e)
-            await message.answer(xrocket_error_text(e))
-            return
-
-        link = pick_link(invoice)
-        invoice_id = invoice.get("id") or invoice.get("invoiceId")
-        if not link or not invoice_id:
-            await message.answer(
-                "⚠️ xRocket вернул инвойс без ссылки или ID.\n\n"
-                "Ответ API:\n<code>" + str(invoice)[:800] + "</code>",
-                parse_mode="HTML"
-            )
-            return
-
+            await message.answer(xrocket_error_text(e)); return
+        link = pick_link(inv); iid = inv.get("id") or inv.get("invoiceId")
+        if not link or not iid:
+            await message.answer("⚠️ Нет ссылки: <code>" + str(inv)[:600] + "</code>", parse_mode="HTML"); return
         sb.table("invoices").insert({
-            "invoice_id": str(invoice_id),
-            "pet_id": pet_id,
-            "owner_id": user.id,
-            "amount": amount,
-            "currency": pet.get("currency", "USDT"),
-            "status": "pending",
+            "invoice_id": str(iid), "pet_id": pet_id, "owner_id": user.id,
+            "amount": amount, "currency": pet.get("currency","USDT"), "status": "pending",
         }).execute()
-
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"💳 Оплатить {amount} {pet.get('currency','USDT')}", url=link)],
-            [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{invoice_id}")],
-        ])
-        await message.answer(
-            f"💳 Счёт на {amount} {pet.get('currency','USDT')} для банка питомца.\n\n"
-            f"Оплати по кнопке выше. После оплаты нажми «Проверить оплату».",
-            reply_markup=kb
-        )
-        return
+            [InlineKeyboardButton(text=f"💳 Оплатить {amount}", url=link)],
+            [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{iid}")]])
+        await message.answer(f"💳 Счёт на {amount}. После оплаты жми «Проверить».", reply_markup=kb); return
 
     if payload.startswith("salary_"):
         parts = payload[7:].split("_")
-        if len(parts) < 3:
-            await message.answer("Неверный формат команды зарплаты.")
-            return
-        pet_id = parts[0]
-        try:
-            cents = int(parts[1])
-            top_n = int(parts[2])
-        except ValueError:
-            await message.answer("Неверные параметры зарплаты.")
-            return
-        amount = cents / 100.0
-        await run_salary_pet(pet_id, user.id, amount, top_n, message)
-        return
+        if len(parts) < 3: await message.answer("Ошибка зарплаты."); return
+        try: cents = int(parts[1]); top_n = int(parts[2])
+        except: await message.answer("Ошибка параметров."); return
+        await run_salary_pet(parts[0], user.id, cents/100.0, top_n, message); return
 
     await message.answer(
-        "👋 Это бот общего питомца.\n\nСоздай питомца — получишь ссылку для друзей.\n\n"
-        "<b>Для владельца:</b>\n"
-        "/balance — баланс банка\n"
-        "/topup 1 — пополнить банк на 1 USDT\n"
-        "/salary 1 3 — раздать 1 USDT топ-3",
-        parse_mode="HTML",
+        "👋 Это бот общего питомца.\n\nСоздай питомца — получишь ссылку для друзей.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🐣 Создать питомца", callback_data="create")],
-            [InlineKeyboardButton(text="📋 Мои питомцы", callback_data="my_pets")],
-        ])
-    )
+            [InlineKeyboardButton(text="📋 Мои питомцы", callback_data="my_pets")]]))
+
+
+# ============ уведомления владельцу ============
+
+async def notify_loop():
+    """Раз в час проверяет статы всех питомцев и пишет владельцам."""
+    while True:
+        try:
+            pets = many(sb.table("pets").select("*"))
+            now = datetime.now(timezone.utc)
+            for p in pets:
+                last = p.get("last_notified_at")
+                if last:
+                    last_dt = datetime.fromisoformat(last.replace("Z","+00:00"))
+                    if (now - last_dt).total_seconds() < NOTIFY_COOLDOWN_HOURS * 3600:
+                        continue
+                msgs = []
+                if p.get("hunger",100) < 30: msgs.append("🍖 Я голоден!")
+                if p.get("mood",100) < 30:   msgs.append("😢 Мне скучно…")
+                if p.get("clean",100) < 30:  msgs.append("🧼 Я грязный…")
+                if p.get("energy",100) < 20: msgs.append("💤 Я устал…")
+                if p.get("health",100) < 30: msgs.append("💔 Мне плохо!")
+                if not msgs: continue
+                text = f"🐾 <b>Питомец «{escape_html(p['name'])}»</b>\n\n" + "\n".join(msgs)
+                text += "\n\nОткрой приложение и позаботься о нём."
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🐾 Открыть питомца",
+                                          web_app=WebAppInfo(url=webapp_url(p["id"])))]])
+                try:
+                    await bot.send_message(p["owner_id"], text, parse_mode="HTML", reply_markup=kb)
+                    sb.table("pets").update({"last_notified_at": now.isoformat()}).eq("id", p["id"]).execute()
+                except Exception as e:
+                    log.warning("notify %s failed: %s", p["owner_id"], e)
+        except Exception as e:
+            log.error("notify_loop error: %s", e)
+        await asyncio.sleep(3600)
 
 
 # ============ проверка оплаты ============
 
 @dp.callback_query(F.data.startswith("check_"))
 async def cb_check_payment(call: CallbackQuery):
-    invoice_id = call.data[6:]
-    user = call.from_user
-
-    inv = one(sb.table("invoices").select("*").eq("invoice_id", invoice_id))
-    if not inv:
-        await call.answer("Инвойс не найден", show_alert=True)
-        return
-    if inv["owner_id"] != user.id:
-        await call.answer("Это не твой счёт", show_alert=True)
-        return
+    iid = call.data[6:]; user = call.from_user
+    inv = one(sb.table("invoices").select("*").eq("invoice_id", iid))
+    if not inv or inv["owner_id"] != user.id:
+        await call.answer("Нет доступа", show_alert=True); return
     if inv["status"] == "paid":
-        await call.answer("Уже оплачен ✅", show_alert=True)
-        return
-
+        await call.answer("Уже оплачен ✅", show_alert=True); return
     try:
-        status_data = await get_invoice_status(invoice_id)
+        st = await get_invoice_status(iid)
     except Exception as e:
-        data = getattr(e, "data", None) or {}
-        status_code = getattr(e, "status", "?")
-        detail = data.get("detail") or data.get("title") or str(e)
-        log.error("check invoice failed: %s", e)
-        await call.answer(f"xRocket {status_code}: {detail[:180]}", show_alert=True)
-        return
-
-    log.info("invoice status: %s", status_data)
-
-    status = (
-        status_data.get("status")
-        or status_data.get("state")
-        or (status_data.get("invoice") or {}).get("status")
-        or ""
-    ).lower()
-
-    if status in ("paid", "success", "completed", "paid_success"):
+        d = getattr(e,"data",None) or {}
+        await call.answer(f"xRocket {getattr(e,'status','?')}: {(d.get('detail') or str(e))[:180]}", show_alert=True); return
+    status = (st.get("status") or st.get("state") or (st.get("invoice") or {}).get("status") or "").lower()
+    if status in ("paid","success","completed","paid_success"):
         pet = one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
         if pet:
-            new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
-            sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
-            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", invoice_id).execute()
+            nb = float(pet.get("bank_balance") or 0) + float(inv["amount"])
+            sb.table("pets").update({"bank_balance": nb}).eq("id", inv["pet_id"]).execute()
+            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", iid).execute()
             await call.answer("Оплачено! ✅", show_alert=True)
-            try:
-                await call.message.edit_text(
-                    f"✅ Банк пополнен на {inv['amount']}.\nБаланс: {new_balance:.4f} USDT"
-                )
-            except Exception:
-                pass
+            try: await call.message.edit_text(f"✅ Банк пополнен. Баланс: {nb:.4f}")
+            except: pass
             return
-
-    await call.answer(
-        f"Статус: {status or 'неизвестно'}\n{str(status_data)[:200]}",
-        show_alert=True
-    )
+    await call.answer(f"Статус: {status or 'неизвестно'}", show_alert=True)
 
 
 # ============ команды владельца ============
 
 @dp.message(Command("balance"))
-async def cmd_balance(message: Message):
-    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
-    if not pet:
-        await message.answer("У тебя нет питомца, где ты владелец.")
-        return
-    await message.answer(
-        f"🏦 Банк питомца «{pet['name']}»: <b>{float(pet.get('bank_balance') or 0):.4f} "
-        f"{pet.get('currency','USDT')}</b>",
-        parse_mode="HTML"
-    )
-
-
-@dp.message(Command("topup"))
-async def cmd_topup(message: Message):
-    user = message.from_user
-    pet = one(sb.table("pets").select("*").eq("owner_id", user.id))
-    if not pet:
-        await message.answer("У тебя нет питомца, где ты владелец.")
-        return
-
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await message.answer("Использование: /topup 1")
-        return
-    try:
-        amount = float(parts[1].replace(",", "."))
-    except ValueError:
-        await message.answer("Не могу разобрать сумму.")
-        return
-    if amount <= 0 or amount > 1000:
-        await message.answer("Сумма должна быть от 0.01 до 1000 USDT")
-        return
-
-    await message.answer(f"💳 Создаю счёт на {amount} {pet.get('currency','USDT')}…")
-    try:
-        invoice = await create_invoice(
-            amount=amount,
-            currency=pet.get("currency", "USDT"),
-            description=f"Пополнение банка питомца «{pet['name']}»"
-        )
-    except Exception as e:
-        log.error("invoice failed: %s", e)
-        await message.answer(xrocket_error_text(e))
-        return
-
-    link = pick_link(invoice)
-    invoice_id = invoice.get("id") or invoice.get("invoiceId")
-    if not link or not invoice_id:
-        await message.answer("⚠️ xRocket вернул инвойс без ссылки:\n<code>" + str(invoice)[:800] + "</code>", parse_mode="HTML")
-        return
-
-    sb.table("invoices").insert({
-        "invoice_id": str(invoice_id),
-        "pet_id": pet["id"],
-        "owner_id": user.id,
-        "amount": amount,
-        "currency": pet.get("currency", "USDT"),
-        "status": "pending",
-    }).execute()
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💳 Оплатить {amount} USDT", url=link)],
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{invoice_id}")],
-    ])
-    await message.answer(
-        f"💳 Счёт на {amount} USDT. После оплаты нажми «Проверить оплату».",
-        reply_markup=kb
-    )
+async def cmd_balance(m: Message):
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
+    if not pet: await m.answer("Нет питомца."); return
+    await m.answer(f"🏦 Баланс: <b>{float(pet.get('bank_balance') or 0):.4f} USDT</b>", parse_mode="HTML")
 
 
 @dp.message(Command("salary"))
-async def cmd_salary(message: Message):
-    user = message.from_user
-    pet = one(sb.table("pets").select("*").eq("owner_id", user.id))
-    if not pet:
-        await message.answer("У тебя нет питомца, где ты владелец.")
-        return
-
-    parts = message.text.split()
-    amount = None
-    top_n = None
+async def cmd_salary(m: Message):
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
+    if not pet: await m.answer("Нет питомца."); return
+    parts = m.text.split()
+    amount = None; top_n = None
     if len(parts) >= 2:
-        try:
-            amount = float(parts[1].replace(",", "."))
-        except ValueError:
-            await message.answer("Не могу разобрать сумму. Пример: /salary 1 3")
-            return
+        try: amount = float(parts[1].replace(",","."))
+        except: await m.answer("Формат: /salary 1 3"); return
     if len(parts) >= 3:
-        try:
-            top_n = int(parts[2])
-        except ValueError:
-            await message.answer("Не могу разобрать топ-N.")
-            return
-
-    await run_salary_pet(pet["id"], user.id, amount, top_n, message)
+        try: top_n = int(parts[2])
+        except: await m.answer("Формат: /salary 1 3"); return
+    await run_salary_pet(pet["id"], m.from_user.id, amount, top_n, m)
 
 
-async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n: int | None, message: Message):
+async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
     pet = one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet:
-        await message.answer("Питомец не найден.")
-        return
-    if pet["owner_id"] != owner_id:
-        await message.answer("Только владелец может запускать зарплату.")
-        return
-
+    if not pet or pet["owner_id"] != owner_id:
+        await message.answer("Нет доступа."); return
     balance = float(pet.get("bank_balance") or 0)
-    if balance <= 0:
-        await message.answer("Банк пуст.")
-        return
-
-    if amount is None or amount <= 0:
-        amount = balance
-    if amount > balance:
-        await message.answer(f"В банке только {balance:.4f}. Уменьши сумму.")
-        return
+    if balance <= 0: await message.answer("Банк пуст."); return
+    if amount is None or amount <= 0: amount = balance
+    if amount > balance: await message.answer(f"В банке только {balance:.4f}."); return
 
     today = date.today().isoformat()
     members = many(sb.table("members").select("*").eq("pet_id", pet["id"]))
-
     for m in members:
         if m.get("today_date") != today:
-            sb.table("members").update({
-                "today_score": 0, "today_date": today
-            }).eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
+            sb.table("members").update({"today_score": 0, "today_date": today})\
+              .eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
             m["today_score"] = 0
-
     active = [m for m in members if (m.get("today_score") or 0) > 0]
-    if not active:
-        await message.answer("Сегодня никто не был активен — распределять нечего.")
-        return
-
-    active.sort(key=lambda m: m["today_score"], reverse=True)
-    if top_n and top_n > 0 and top_n < len(active):
-        winners = active[:top_n]
-    else:
-        winners = active
-
-    total_score = sum(m["today_score"] for m in winners)
-    if total_score <= 0:
-        await message.answer("Нет очков для распределения.")
-        return
-
-    min_share = min(
-        round(amount * (m["today_score"] / total_score), 6)
-        for m in winners
-    )
+    if not active: await message.answer("Нет активных."); return
+    active.sort(key=lambda x: x["today_score"], reverse=True)
+    winners = active[:top_n] if (top_n and 0 < top_n < len(active)) else active
+    total = sum(w["today_score"] for w in winners)
+    if total <= 0: await message.answer("Нет очков."); return
+    min_share = min(round(amount * (w["today_score"]/total), 6) for w in winners)
     if min_share < MIN_CHEQUE:
-        await message.answer(
-            f"❌ Слишком мелкие чеки.\n\n"
-            f"Сумма: {amount:.4f}, получателей: {len(winners)}, "
-            f"минимальная доля: {min_share:.4f} USDT.\n\n"
-            f"Минимум на один чек: {MIN_CHEQUE} USDT."
-        )
-        return
+        await message.answer(f"❌ Доли слишком малы ({min_share:.4f} < {MIN_CHEQUE})."); return
 
     sb.table("pets").update({"bank_balance": balance - amount}).eq("id", pet["id"]).execute()
-
-    payout_res = sb.table("payouts").insert({
-        "pet_id": pet["id"],
-        "owner_id": owner_id,
-        "total_amount": amount,
-        "currency": pet.get("currency", "USDT"),
-        "member_count": len(winners),
-    }).execute()
-    payout = payout_res.data[0]
-
-    await message.answer(
-        f"💸 Раздаю {amount:.4f} {pet.get('currency','USDT')} "
-        f"между топ-{len(winners)}…"
-    )
-
-    sent = 0
-    total_sent_amount = 0.0
-    paid_user_ids = []
-    failed_msg = ""
-
+    po = sb.table("payouts").insert({
+        "pet_id": pet["id"], "owner_id": owner_id, "total_amount": amount,
+        "currency": pet.get("currency","USDT"), "member_count": len(winners)}).execute()
+    payout = po.data[0]
+    await message.answer(f"💸 Раздаю {amount:.4f} на топ-{len(winners)}…")
+    sent = 0; total_sent = 0.0; paid = []; failed_msg = ""
     for i, m in enumerate(winners):
         score = m["today_score"]
-        share = round(amount * (score / total_score), 6)
-        if share < MIN_CHEQUE:
-            continue
-
+        share = round(amount * (score/total), 6)
+        if share < MIN_CHEQUE: continue
         try:
-            cheque = await create_cheque(
-                user_id=m["user_id"],
-                amount=share,
-                currency=pet.get("currency", "USDT"),
-                description=f"Зарплата за активность ({score} очков)"
-            )
+            ch = await create_cheque(m["user_id"], share, pet.get("currency","USDT"),
+                                     f"Зарплата ({score} очков)")
         except Exception as e:
-            log.error("cheque #%s for %s failed: %s", i + 1, m["user_id"], e)
-            data = getattr(e, "data", None) or {}
-            failed_msg = data.get("detail") or data.get("title") or str(e)
-            break
-
-        cheque_id = cheque.get("chequeId") or cheque.get("id")
-        link = pick_link(cheque)
-
+            d = getattr(e,"data",None) or {}
+            failed_msg = d.get("detail") or d.get("title") or str(e); break
+        cid = ch.get("chequeId") or ch.get("id"); link = pick_link(ch)
         sb.table("cheques").insert({
-            "payout_id": payout["id"],
-            "pet_id": pet["id"],
-            "user_id": m["user_id"],
-            "amount": share,
-            "cheque_id": cheque_id,
-            "cheque_link": link,
-            "status": "sent" if link else "no_link",
-        }).execute()
-
+            "payout_id": payout["id"], "pet_id": pet["id"], "user_id": m["user_id"],
+            "amount": share, "cheque_id": cid, "cheque_link": link,
+            "status": "sent" if link else "no_link"}).execute()
         if link:
             try:
-                await bot.send_message(
-                    m["user_id"],
-                    f"💰 <b>Зарплата за питомца «{pet['name']}»!</b>\n\n"
-                    f"Твоя активность: {score} очков\n"
-                    f"Начислено: <b>{share:.4f} {pet.get('currency','USDT')}</b>\n\n"
-                    f"Забрать: {link}",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-            except Exception as e:
-                log.warning("send to %s failed: %s", m["user_id"], e)
+                await bot.send_message(m["user_id"],
+                    f"💰 <b>Зарплата за питомца «{pet['name']}»</b>\n\n"
+                    f"Активность: {score} очков\nНачислено: <b>{share:.4f} USDT</b>\n\nЗабрать: {link}",
+                    parse_mode="HTML", disable_web_page_preview=True)
+            except Exception as e: log.warning("send: %s", e)
+        sent += 1; total_sent += share; paid.append(m["user_id"])
 
-        sent += 1
-        total_sent_amount += share
-        paid_user_ids.append(m["user_id"])
-
-    refund = round(amount - total_sent_amount, 6)
+    refund = round(amount - total_sent, 6)
     if refund > 0:
-        pet_now = one(sb.table("pets").select("*").eq("id", pet["id"]))
-        current_bank = float(pet_now.get("bank_balance") or 0)
-        sb.table("pets").update({"bank_balance": current_bank + refund}).eq("id", pet["id"]).execute()
-
+        pn = one(sb.table("pets").select("*").eq("id", pet["id"]))
+        cb = float(pn.get("bank_balance") or 0)
+        sb.table("pets").update({"bank_balance": cb + refund}).eq("id", pet["id"]).execute()
     for m in winners:
-        if m["user_id"] in paid_user_ids:
-            sb.table("members").update({
-                "today_score": 0, "today_date": today
-            }).eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
-
-    pet_now = one(sb.table("pets").select("*").eq("id", pet["id"]))
-    final_bank = float(pet_now.get("bank_balance") or 0)
-
-    text = (
-        f"✅ Выплата завершена.\n"
-        f"Выплачено: {total_sent_amount:.4f} из {amount:.4f}\n"
-        f"Чеков создано: {sent} из {len(winners)}\n"
-        f"Остаток в банке: {final_bank:.4f} USDT"
-    )
-    if failed_msg:
-        text += f"\n\n⚠️ Прервано на чеке #{sent + 1}: {failed_msg}\nНевыплаченное вернулось в банк."
+        if m["user_id"] in paid:
+            sb.table("members").update({"today_score": 0, "today_date": today})\
+              .eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
+    pn = one(sb.table("pets").select("*").eq("id", pet["id"]))
+    final = float(pn.get("bank_balance") or 0)
+    text = f"✅ Выплата.\nВыплачено: {total_sent:.4f} из {amount:.4f}\nЧеков: {sent}\nОстаток: {final:.4f}"
+    if failed_msg: text += f"\n\n⚠️ Прервано: {failed_msg}"
     await message.answer(text)
 
 
 # ============ АДМИНКА ============
 
 @dp.message(Command("admin"))
-async def cmd_admin(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    await message.answer(
-        "🛠 <b>Админ-команды</b>\n\n"
-        "<b>Баланс питомца:</b>\n"
-        "/setbal 5 — установить баланс своему питомцу\n"
+async def cmd_admin(m: Message):
+    if not is_admin(m.from_user.id): return
+    await m.answer(
+        "🛠 <b>Админка</b>\n\n"
+        "/setbal 5 — баланс своему питомцу\n"
         "/addbal 1 — прибавить к балансу\n"
-        "/setbal_pet &lt;pet_id&gt; 5 — установить баланс питомцу по ID\n"
-        "/addbal_pet &lt;pet_id&gt; 1 — прибавить питомцу по ID\n"
-        "/list_pets — список всех питомцев с балансами\n\n"
-        "<b>Питомец:</b>\n"
-        "/addxp 200 — добавить XP питомцу (тест эволюций)\n"
-        "/reset_scores — обнулить today_score у всех\n\n"
-        "<b>Чеки:</b>\n"
-        "/cheques — список активных чеков\n"
-        "/cancel_cheques — отменить все висящие чеки и вернуть деньги\n"
-        "/xr — баланс приложения xRocket",
-        parse_mode="HTML"
-    )
+        "/setbal_pet &lt;id&gt; 5 — баланс по ID\n"
+        "/addbal_pet &lt;id&gt; 1 — прибавить по ID\n"
+        "/list_pets — все питомцы\n"
+        "/addxp 200 — добавить XP\n"
+        "/reset_scores — обнулить дневные очки\n"
+        "/cheques — список чеков\n"
+        "/cancel_cheques — отменить все\n"
+        "/xr — баланс xRocket\n"
+        "/test_notify — прислать уведомление сейчас",
+        parse_mode="HTML")
 
 
 @dp.message(Command("setbal"))
-async def cmd_setbal(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Использование: /setbal 5")
-        return
-    try:
-        amount = float(parts[1].replace(",", "."))
-    except ValueError:
-        await message.answer("Не могу разобрать сумму.")
-        return
-    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
-    if not pet:
-        await message.answer("У тебя нет питомца.")
-        return
+async def cmd_setbal(m: Message):
+    if not is_admin(m.from_user.id): return
+    parts = m.text.split()
+    if len(parts) < 2: await m.answer("Формат: /setbal 5"); return
+    try: amount = float(parts[1].replace(",","."))
+    except: await m.answer("Не разобрать сумму."); return
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
+    if not pet: await m.answer("Нет питомца."); return
     sb.table("pets").update({"bank_balance": amount}).eq("id", pet["id"]).execute()
-    await message.answer(f"✅ Баланс питомца «{pet['name']}»: {amount:.4f} USDT")
+    await m.answer(f"✅ {amount:.4f} USDT")
 
 
 @dp.message(Command("addbal"))
-async def cmd_addbal(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Использование: /addbal 1")
-        return
-    try:
-        amount = float(parts[1].replace(",", "."))
-    except ValueError:
-        await message.answer("Не могу разобрать сумму.")
-        return
-    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
-    if not pet:
-        await message.answer("У тебя нет питомца.")
-        return
-    new_balance = float(pet.get("bank_balance") or 0) + amount
-    sb.table("pets").update({"bank_balance": new_balance}).eq("id", pet["id"]).execute()
-    await message.answer(f"✅ Баланс питомца «{pet['name']}»: {new_balance:.4f} USDT")
+async def cmd_addbal(m: Message):
+    if not is_admin(m.from_user.id): return
+    parts = m.text.split()
+    if len(parts) < 2: await m.answer("Формат: /addbal 1"); return
+    try: amount = float(parts[1].replace(",","."))
+    except: await m.answer("Не разобрать."); return
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
+    if not pet: await m.answer("Нет питомца."); return
+    nb = float(pet.get("bank_balance") or 0) + amount
+    sb.table("pets").update({"bank_balance": nb}).eq("id", pet["id"]).execute()
+    await m.answer(f"✅ {nb:.4f} USDT")
 
 
 @dp.message(Command("setbal_pet"))
-async def cmd_setbal_pet(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.answer("Использование: /setbal_pet <pet_id> 5")
-        return
-    pet_id = parts[1].strip()
-    try:
-        amount = float(parts[2].replace(",", "."))
-    except ValueError:
-        await message.answer("Не могу разобрать сумму.")
-        return
-    if len(pet_id) < 30:
-        await message.answer("Похоже, это не UUID. Возьми ID из /list_pets.")
-        return
-    pet = one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet:
-        await message.answer("Питомец с таким ID не найден.")
-        return
-    sb.table("pets").update({"bank_balance": amount}).eq("id", pet_id).execute()
-    await message.answer(f"✅ «{pet['name']}»: {amount:.4f} USDT")
+async def cmd_setbal_pet(m: Message):
+    if not is_admin(m.from_user.id): return
+    parts = m.text.split()
+    if len(parts) < 3: await m.answer("Формат: /setbal_pet <id> 5"); return
+    pid = parts[1].strip()
+    try: amount = float(parts[2].replace(",","."))
+    except: await m.answer("Не разобрать."); return
+    if len(pid) < 30: await m.answer("Не UUID."); return
+    pet = one(sb.table("pets").select("*").eq("id", pid))
+    if not pet: await m.answer("Не найден."); return
+    sb.table("pets").update({"bank_balance": amount}).eq("id", pid).execute()
+    await m.answer(f"✅ «{pet['name']}»: {amount:.4f}")
 
 
 @dp.message(Command("addbal_pet"))
-async def cmd_addbal_pet(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.answer("Использование: /addbal_pet <pet_id> 1")
-        return
-    pet_id = parts[1].strip()
-    try:
-        amount = float(parts[2].replace(",", "."))
-    except ValueError:
-        await message.answer("Не могу разобрать сумму.")
-        return
-    if len(pet_id) < 30:
-        await message.answer("Похоже, это не UUID. Возьми ID из /list_pets.")
-        return
-    pet = one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet:
-        await message.answer("Питомец с таким ID не найден.")
-        return
-    new_balance = float(pet.get("bank_balance") or 0) + amount
-    sb.table("pets").update({"bank_balance": new_balance}).eq("id", pet_id).execute()
-    await message.answer(f"✅ «{pet['name']}»: {new_balance:.4f} USDT")
+async def cmd_addbal_pet(m: Message):
+    if not is_admin(m.from_user.id): return
+    parts = m.text.split()
+    if len(parts) < 3: await m.answer("Формат: /addbal_pet <id> 1"); return
+    pid = parts[1].strip()
+    try: amount = float(parts[2].replace(",","."))
+    except: await m.answer("Не разобрать."); return
+    if len(pid) < 30: await m.answer("Не UUID."); return
+    pet = one(sb.table("pets").select("*").eq("id", pid))
+    if not pet: await m.answer("Не найден."); return
+    nb = float(pet.get("bank_balance") or 0) + amount
+    sb.table("pets").update({"bank_balance": nb}).eq("id", pid).execute()
+    await m.answer(f"✅ «{pet['name']}»: {nb:.4f}")
 
 
 @dp.message(Command("list_pets"))
-async def cmd_list_pets(message: Message):
-    if not is_admin(message.from_user.id):
-        return
+async def cmd_list_pets(m: Message):
+    if not is_admin(m.from_user.id): return
     pets = many(sb.table("pets").select("id,name,owner_id,bank_balance,xp"))
-    if not pets:
-        await message.answer("Питомцев нет.")
-        return
+    if not pets: await m.answer("Нет питомцев."); return
     lines = ["🐾 <b>Все питомцы:</b>\n"]
     for p in pets[:30]:
-        lines.append(
-            f"• <code>{p['id']}</code>\n"
-            f"  {p['name']} — {float(p.get('bank_balance') or 0):.4f} USDT, XP {p.get('xp') or 0}"
-        )
-    await message.answer("\n".join(lines), parse_mode="HTML")
+        lines.append(f"• <code>{p['id']}</code>\n  {p['name']} — {float(p.get('bank_balance') or 0):.4f} USDT, XP {p.get('xp') or 0}")
+    await m.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("addxp"))
-async def cmd_addxp(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 2:
-        await message.answer("Использование: /addxp 200")
-        return
-    try:
-        amount = int(parts[1])
-    except ValueError:
-        await message.answer("Не могу разобрать число.")
-        return
-    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
-    if not pet:
-        await message.answer("У тебя нет питомца.")
-        return
-    old_xp = pet.get("xp") or 0
-    new_xp = old_xp + amount
-    sb.table("pets").update({"xp": new_xp}).eq("id", pet["id"]).execute()
-
-    def lvl(xp): return min(30, xp // 50 + 1)
-    def stage(l):
-        return 4 if l>=25 else 3 if l>=17 else 2 if l>=10 else 1 if l>=5 else 0
-    old_l = lvl(old_xp); new_l = lvl(new_xp)
-    old_s = stage(old_l); new_s = stage(new_l)
-    stages = ["🥚","🐣","🐥","🐓","🦅"]
-
-    text = f"✅ XP: {old_xp} → {new_xp}\nУровень: {old_l} → {new_l}"
-    if new_s != old_s:
-        text += f"\n✨ Эволюция: {stages[old_s]} → {stages[new_s]}"
-    await message.answer(text)
+async def cmd_addxp(m: Message):
+    if not is_admin(m.from_user.id): return
+    parts = m.text.split()
+    if len(parts) < 2: await m.answer("Формат: /addxp 200"); return
+    try: amount = int(parts[1])
+    except: await m.answer("Не число."); return
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
+    if not pet: await m.answer("Нет питомца."); return
+    ox = pet.get("xp") or 0; nx = ox + amount
+    sb.table("pets").update({"xp": nx}).eq("id", pet["id"]).execute()
+    def lvl(x): return min(30, x//50+1)
+    def st(l): return 4 if l>=25 else 3 if l>=17 else 2 if l>=10 else 1 if l>=5 else 0
+    ol, nl = lvl(ox), lvl(nx); os, ns = st(ol), st(nl)
+    names = ["🥚","🐣","🐥","🐓","🦅"]
+    t = f"✅ XP: {ox} → {nx} (ур. {ol} → {nl})"
+    if ns != os: t += f"\n✨ {names[os]} → {names[ns]}"
+    await m.answer(t)
 
 
 @dp.message(Command("reset_scores"))
-async def cmd_reset_scores(message: Message):
-    if not is_admin(message.from_user.id):
-        return
+async def cmd_reset_scores(m: Message):
+    if not is_admin(m.from_user.id): return
     today = date.today().isoformat()
     sb.table("members").update({"today_score": 0, "today_date": today}).neq("user_id", 0).execute()
-    await message.answer("✅ Дневные очки обнулены у всех.")
+    await m.answer("✅ Обнулено.")
+
+
+@dp.message(Command("test_notify"))
+async def cmd_test_notify(m: Message):
+    if not is_admin(m.from_user.id): return
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
+    if not pet: await m.answer("Нет питомца."); return
+    text = f"🐾 <b>Тест уведомления</b>\n\nПитомец «{pet['name']}» — так будет выглядеть напоминание."
+    await bot.send_message(m.from_user.id, text, parse_mode="HTML")
+    await m.answer("✅ Отправлено.")
 
 
 @dp.message(Command("xr"))
-async def cmd_xr(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    await message.answer("🔍 Проверяю xRocket…")
-
+async def cmd_xr(m: Message):
+    if not is_admin(m.from_user.id): return
+    await m.answer("🔍 Проверяю…")
     bal = await get_app_balance()
-    cheques = await list_xrocket_cheques()
-
-    lines = ["<b>📊 xRocket диагностика</b>\n"]
-
+    ch = await list_xrocket_cheques()
+    lines = ["<b>📊 xRocket</b>\n"]
     if bal:
-        lines.append(f"✅ Баланс найден через <code>{bal['path']}</code>")
-        lines.append(f"<pre>{str(bal['data'])[:500]}</pre>")
+        lines.append(f"✅ {bal['path']}")
+        lines.append(f"<pre>{str(bal['data'])[:400]}</pre>")
     else:
-        lines.append("❌ Не удалось получить баланс ни через один из путей.")
-
-    lines.append(f"\n🧾 Активных чеков: {len(cheques)}")
-    for c in cheques[:10]:
-        cid = c.get("chequeId") or c.get("id")
-        amount = c.get("amount") or "?"
-        lines.append(f"• <code>{cid}</code> — {amount}")
-
-    await message.answer("\n".join(lines), parse_mode="HTML")
+        lines.append("❌ Не удалось получить баланс.")
+    lines.append(f"\n🧾 Чеков: {len(ch)}")
+    for c in ch[:10]:
+        lines.append(f"• <code>{c.get('chequeId') or c.get('id')}</code> — {c.get('amount','?')}")
+    await m.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("cheques"))
-async def cmd_cheques(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    lines = ["🧾 <b>Активные чеки</b>\n"]
-
+async def cmd_cheques(m: Message):
+    if not is_admin(m.from_user.id): return
+    lines = ["🧾 <b>Чеки</b>\n"]
     xr = await list_xrocket_cheques()
-    lines.append(f"<b>Из xRocket:</b> {len(xr)}")
+    lines.append(f"<b>xRocket:</b> {len(xr)}")
     for c in xr[:10]:
-        cid = c.get("chequeId") or c.get("id")
-        amount = c.get("amount") or "?"
-        state = c.get("state") or "?"
-        lines.append(f"• <code>{cid}</code> — {amount} USDT [{state}]")
-
-    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
+        lines.append(f"• <code>{c.get('chequeId') or c.get('id')}</code> — {c.get('amount','?')} [{c.get('state','?')}]")
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
     if pet:
-        db = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status", "sent"))
-        lines.append(f"\n<b>Из БД (sent):</b> {len(db)}")
+        db = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
+        lines.append(f"\n<b>БД (sent):</b> {len(db)}")
         for c in db[:10]:
             lines.append(f"• <code>{c.get('cheque_id')}</code> — {float(c.get('amount') or 0):.4f}")
-
-    lines.append("\nОтменить всё: /cancel_cheques")
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    lines.append("\n/cancel_cheques — отменить все")
+    await m.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("cancel_cheques"))
-async def cmd_cancel_cheques(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-
-    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
-    if not pet:
-        await message.answer("У тебя нет питомца.")
-        return
-
-    xr_cheques = await list_xrocket_cheques()
-    db_cheques = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status", "sent"))
-
-    all_ids = {}
-    for c in xr_cheques:
+async def cmd_cancel_cheques(m: Message):
+    if not is_admin(m.from_user.id): return
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
+    if not pet: await m.answer("Нет питомца."); return
+    xr = await list_xrocket_cheques()
+    db = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
+    ids = {}
+    for c in xr:
         cid = c.get("chequeId") or c.get("id")
-        if cid:
-            all_ids[str(cid)] = {"id": str(cid), "amount": c.get("amount") or 0}
-    for c in db_cheques:
+        if cid: ids[str(cid)] = {"amount": c.get("amount") or 0}
+    for c in db:
         cid = c.get("cheque_id")
-        if cid and str(cid) not in all_ids:
-            all_ids[str(cid)] = {"id": str(cid), "amount": c.get("amount") or 0}
-
-    if not all_ids:
-        await message.answer(
-            "Найти активные чеки не удалось.\n"
-            "Проверь вручную в @xRocket → Wallet → удерживается."
-        )
-        return
-
-    await message.answer(f"🔍 Найдено {len(all_ids)} чеков. Пробую отменить…")
-
-    cancelled = 0
-    failed = 0
-    refund_amount = 0.0
-    failed_ids = []
-
-    for cid, info in all_ids.items():
+        if cid and str(cid) not in ids: ids[str(cid)] = {"amount": c.get("amount") or 0}
+    if not ids: await m.answer("Нет активных чеков."); return
+    await m.answer(f"🔍 Отменяю {len(ids)}…")
+    ok = 0; fail = 0; refund = 0.0; fails = []
+    for cid, info in ids.items():
         try:
-            await delete_cheque(cid)
-            cancelled += 1
-            refund_amount += float(info.get("amount") or 0)
+            await delete_cheque(cid); ok += 1
+            refund += float(info.get("amount") or 0)
             sb.table("cheques").update({"status": "cancelled"}).eq("cheque_id", cid).execute()
         except Exception as e:
-            log.error("Failed to cancel %s: %s", cid, e)
-            failed += 1
-            failed_ids.append(cid)
-
-    if refund_amount > 0:
-        pet_now = one(sb.table("pets").select("*").eq("id", pet["id"]))
-        current_bank = float(pet_now.get("bank_balance") or 0)
-        sb.table("pets").update({
-            "bank_balance": round(current_bank + refund_amount, 6)
-        }).eq("id", pet["id"]).execute()
-
-    text = (
-        f"✅ Готово.\n"
-        f"Отменено чеков: {cancelled}\n"
-        f"Ошибок: {failed}\n"
-        f"Возвращено в банк: {refund_amount:.4f} USDT"
-    )
-    if failed_ids:
-        text += "\n\nНе удалось отменить:\n" + "\n".join(f"• <code>{i}</code>" for i in failed_ids[:10])
-    await message.answer(text, parse_mode="HTML")
+            log.error("cancel %s: %s", cid, e); fail += 1; fails.append(cid)
+    if refund > 0:
+        pn = one(sb.table("pets").select("*").eq("id", pet["id"]))
+        cb = float(pn.get("bank_balance") or 0)
+        sb.table("pets").update({"bank_balance": round(cb + refund, 6)}).eq("id", pet["id"]).execute()
+    t = f"✅ Отменено: {ok}\nОшибок: {fail}\nВозвращено: {refund:.4f}"
+    if fails: t += "\n\nНе удалось:\n" + "\n".join(f"• <code>{i}</code>" for i in fails[:10])
+    await m.answer(t, parse_mode="HTML")
 
 
 # ============ create / my_pets / help ============
 
 @dp.callback_query(F.data == "create")
 async def cb_create(call: CallbackQuery):
-    user = call.from_user
-    pet = None
+    user = call.from_user; pet = None
     for _ in range(5):
         code = gen_code()
         try:
-            res = sb.table("pets").insert({"owner_id": user.id, "invite_code": code}).execute()
-            if res.data:
-                pet = res.data[0]
-                break
+            r = sb.table("pets").insert({"owner_id": user.id, "invite_code": code}).execute()
+            if r.data: pet = r.data[0]; break
         except Exception as e:
-            if "23505" not in str(e):
-                break
-    if not pet:
-        await call.answer("Ошибка, попробуй ещё", show_alert=True)
-        return
-    sb.table("members").insert({
-        "pet_id": pet["id"], "user_id": user.id,
-        "first_name": user.first_name or "Гость", "username": user.username,
-    }).execute()
-    await call.answer("Питомец создан!")
+            if "23505" not in str(e): break
+    if not pet: await call.answer("Ошибка.", show_alert=True); return
+    sb.table("members").insert({"pet_id": pet["id"], "user_id": user.id,
+        "first_name": user.first_name or "Гость", "username": user.username}).execute()
+    await call.answer("Готово!")
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start=join_{pet['invite_code']}"
     share = f"https://t.me/share/url?url={link}&text=Ухаживай за нашим питомцем!"
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🐾 Открыть питомца",
-                              web_app=WebAppInfo(url=webapp_url(pet["id"])))],
-        [InlineKeyboardButton(text="📤 Поделиться", url=share)],
-    ])
-    await call.message.answer(
-        f"🐣 <b>Питомец создан!</b>\n\nСсылка:\n<code>{link}</code>",
-        parse_mode="HTML", reply_markup=kb
-    )
+        [InlineKeyboardButton(text="🐾 Открыть", web_app=WebAppInfo(url=webapp_url(pet["id"])))],
+        [InlineKeyboardButton(text="📤 Поделиться", url=share)]])
+    await call.message.answer(f"🐣 <b>Питомец создан!</b>\n\n<code>{link}</code>",
+                              parse_mode="HTML", reply_markup=kb)
 
 
 @dp.callback_query(F.data == "my_pets")
 async def cb_my_pets(call: CallbackQuery):
-    user = call.from_user
     await call.answer()
-    data = many(sb.table("members").select("pet_id, score, pets!inner(id, name, xp)").eq("user_id", user.id).order("score", desc=True).limit(20))
-    if not data:
-        await call.message.answer("У тебя пока нет питомцев.")
-        return
+    data = many(sb.table("members").select("pet_id, score, pets!inner(id, name, xp)")\
+                .eq("user_id", call.from_user.id).order("score", desc=True).limit(20))
+    if not data: await call.message.answer("Нет питомцев."); return
     rows = []
     for m in data:
         p = m.get("pets") or {}
-        if not p:
-            continue
-        lvl = min(30, (p.get("xp") or 0) // 50 + 1)
-        rows.append([InlineKeyboardButton(
-            text=f"🐾 {p['name']} · ур. {lvl}",
-            web_app=WebAppInfo(url=webapp_url(p["id"]))
-        )])
+        if not p: continue
+        lvl = min(30, (p.get("xp") or 0)//50+1)
+        rows.append([InlineKeyboardButton(text=f"🐾 {p['name']} · ур. {lvl}",
+                     web_app=WebAppInfo(url=webapp_url(p["id"])))])
     await call.message.answer("Твои питомцы:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.message(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(
-        "🐾 <b>Как играть</b>\n\n"
-        "1. Создай питомца\n2. Кинь ссылку друзьям\n3. Вместе кормите — он растёт\n\n"
-        "<b>Для владельца:</b>\n"
-        "/balance — баланс банка\n"
-        "/topup 1 — пополнить на 1 USDT\n"
-        "/salary — раздать весь банк\n"
-        "/salary 1 3 — раздать 1 USDT топ-3",
-        parse_mode="HTML"
-    )
+async def cmd_help(m: Message):
+    await m.answer("🐾 Игра про общего питомца. Создай через /start.")
 
 
-# ============ вебхук + health ============
+# ============ API для Mini App (инвентарь, квесты, мини-игра) ============
 
-async def xrocket_webhook(request: web.Request) -> web.Response:
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+async def api_quest_claim(request: web.Request):
+    """POST /api/quest/claim { pet_id, user_id, quest_id }"""
+    try: data = await request.json()
+    except: return web.json_response({"error": "bad json"}, status=400)
+    qid = data.get("quest_id")
+    if not qid: return web.json_response({"error": "no quest_id"}, status=400)
+    q = one(sb.table("quests").select("*").eq("id", qid))
+    if not q: return web.json_response({"error": "not found"}, status=404)
+    if q["progress"] < q["target"]: return web.json_response({"error": "not completed"}, status=400)
+    if q["claimed"]: return web.json_response({"error": "already claimed"}, status=400)
 
-    log.info("xRocket webhook: %s", data)
+    # Награда
+    tmpl = next((t for t in QUEST_TEMPLATES if t["type"] == q["quest_type"]), None)
+    reward = tmpl["reward"] if tmpl else 5
+    m = one(sb.table("members").select("*").eq("pet_id", q["pet_id"]).eq("user_id", q["user_id"]))
+    if m:
+        sb.table("members").update({"score": (m.get("score") or 0) + reward})\
+          .eq("pet_id", q["pet_id"]).eq("user_id", q["user_id"]).execute()
+    sb.table("quests").update({"claimed": True}).eq("id", qid).execute()
+    return web.json_response({"ok": True, "reward": reward})
 
-    invoice_id = data.get("invoiceId") or data.get("id") or (data.get("payload") or {}).get("invoiceId")
+
+async def api_inventory_buy(request: web.Request):
+    """POST /api/inventory/buy { pet_id, user_id, item_type }"""
+    try: data = await request.json()
+    except: return web.json_response({"error": "bad json"}, status=400)
+    pid = data.get("pet_id"); uid = data.get("user_id"); itype = data.get("item_type")
+    if not all([pid, uid, itype]): return web.json_response({"error": "missing"}, status=400)
+
+    PRICES = {"food": 5, "toy": 8, "medicine": 15, "hat": 30}
+    if itype not in PRICES: return web.json_response({"error": "unknown item"}, status=400)
+    price = PRICES[itype]
+
+    m = one(sb.table("members").select("*").eq("pet_id", pid).eq("user_id", uid))
+    if not m or (m.get("score") or 0) < price:
+        return web.json_response({"error": "not enough score"}, status=400)
+    sb.table("members").update({"score": m["score"] - price})\
+      .eq("pet_id", pid).eq("user_id", uid).execute()
+
+    inv = one(sb.table("inventory").select("*").eq("pet_id", pid).eq("user_id", uid).eq("item_type", itype))
+    if inv:
+        sb.table("inventory").update({"count": (inv.get("count") or 0) + 1})\
+          .eq("pet_id", pid).eq("user_id", uid).eq("item_type", itype).execute()
+    else:
+        sb.table("inventory").insert({"pet_id": pid, "user_id": uid, "item_type": itype, "count": 1}).execute()
+    return web.json_response({"ok": True, "new_score": m["score"] - price})
+
+
+async def api_inventory_use(request: web.Request):
+    """POST /api/inventory/use { pet_id, user_id, item_type }"""
+    try: data = await request.json()
+    except: return web.json_response({"error": "bad json"}, status=400)
+    pid = data.get("pet_id"); uid = data.get("user_id"); itype = data.get("item_type")
+    if not all([pid, uid, itype]): return web.json_response({"error": "missing"}, status=400)
+
+    inv = one(sb.table("inventory").select("*").eq("pet_id", pid).eq("user_id", uid).eq("item_type", itype))
+    if not inv or (inv.get("count") or 0) <= 0:
+        return web.json_response({"error": "no item"}, status=400)
+
+    EFFECTS = {
+        "food":     {"hunger": 30, "energy": 15},
+        "toy":      {"mood": 30},
+        "medicine": {"health": 40},
+        "hat":      {},  # косметика, не тратится
+    }
+    pet = one(sb.table("pets").select("*").eq("id", pid))
+    if not pet: return web.json_response({"error": "pet not found"}, status=404)
+
+    eff = EFFECTS.get(itype, {})
+    upd = {}
+    for k, v in eff.items():
+        upd[k] = max(0, min(100, (pet.get(k) or 0) + v))
+
+    if upd: sb.table("pets").update(upd).eq("id", pid).execute()
+
+    # Шапка не тратится
+    if itype != "hat":
+        sb.table("inventory").update({"count": inv["count"] - 1})\
+          .eq("pet_id", pid).eq("user_id", uid).eq("item_type", itype).execute()
+
+    return web.json_response({"ok": True, "effects": upd})
+
+
+async def api_mouse_done(request: web.Request):
+    """POST /api/mouse/done { pet_id, user_id, caught (0 или 1) }"""
+    try: data = await request.json()
+    except: return web.json_response({"error": "bad json"}, status=400)
+    pid = data.get("pet_id"); uid = data.get("user_id"); caught = data.get("caught", 0)
+    if not all([pid, uid]): return web.json_response({"error": "missing"}, status=400)
+
+    # Проверяем кулдаун (раз в час)
+    m = one(sb.table("members").select("*").eq("pet_id", pid).eq("user_id", uid))
+    if not m: return web.json_response({"error": "no member"}, status=400)
+    last = m.get("last_mouse_at")
+    if last:
+        last_dt = datetime.fromisoformat(last.replace("Z","+00:00"))
+        if (datetime.now(timezone.utc) - last_dt).total_seconds() < 3600:
+            return web.json_response({"error": "cooldown"}, status=400)
+
+    sb.table("members").update({"last_mouse_at": datetime.now(timezone.utc).isoformat()})\
+      .eq("pet_id", pid).eq("user_id", uid).execute()
+
+    reward = 0
+    if caught:
+        reward = 3
+        sb.table("members").update({"score": (m.get("score") or 0) + reward})\
+          .eq("pet_id", pid).eq("user_id", uid).execute()
+        pet = one(sb.table("pets").select("*").eq("id", pid))
+        if pet:
+            nx = (pet.get("xp") or 0) + 2
+            sb.table("pets").update({"xp": nx, "mood": min(100, (pet.get("mood") or 0) + 5)})\
+              .eq("id", pid).execute()
+
+    return web.json_response({"ok": True, "reward": reward})
+
+
+async def api_quests_list(request: web.Request):
+    """GET /api/quests?pet_id=...&user_id=..."""
+    pid = request.query.get("pet_id"); uid = request.query.get("user_id")
+    if not all([pid, uid]): return web.json_response({"error": "missing"}, status=400)
+    ensure_quests(pid, int(uid))
+    today = date.today().isoformat()
+    qs = many(sb.table("quests").select("*").eq("pet_id", pid).eq("user_id", int(uid)).eq("quest_date", today))
+    return web.json_response({"quests": qs})
+
+
+async def api_inventory_list(request: web.Request):
+    pid = request.query.get("pet_id"); uid = request.query.get("user_id")
+    if not all([pid, uid]): return web.json_response({"error": "missing"}, status=400)
+    inv = many(sb.table("inventory").select("*").eq("pet_id", pid).eq("user_id", int(uid)))
+    return web.json_response({"items": inv})
+
+
+async def health(request: web.Request):
+    return web.json_response({"ok": True, "service": "pet-bot"})
+
+
+# ============ вебхук ============
+
+async def xrocket_webhook(request: web.Request):
+    try: data = await request.json()
+    except: return web.json_response({"ok": False}, status=400)
+    iid = data.get("invoiceId") or data.get("id") or (data.get("payload") or {}).get("invoiceId")
     status = (data.get("status") or data.get("type") or "").lower()
-
-    if not invoice_id:
-        return web.json_response({"ok": True, "ignored": "no invoiceId"})
-
-    inv = one(sb.table("invoices").select("*").eq("invoice_id", str(invoice_id)))
-    if not inv or inv["status"] == "paid":
-        return web.json_response({"ok": True})
-
-    if any(k in status for k in ("paid", "success", "completed", "invoice_paid")):
+    if not iid: return web.json_response({"ok": True})
+    inv = one(sb.table("invoices").select("*").eq("invoice_id", str(iid)))
+    if not inv or inv["status"] == "paid": return web.json_response({"ok": True})
+    if any(k in status for k in ("paid","success","completed","invoice_paid")):
         pet = one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
         if pet:
-            new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
-            sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
-            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", str(invoice_id)).execute()
+            nb = float(pet.get("bank_balance") or 0) + float(inv["amount"])
+            sb.table("pets").update({"bank_balance": nb}).eq("id", inv["pet_id"]).execute()
+            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", str(iid)).execute()
             try:
-                await bot.send_message(
-                    inv["owner_id"],
-                    f"✅ Оплата получена. Банк пополнен на {inv['amount']} USDT.\n"
-                    f"Текущий баланс: {new_balance:.4f} USDT"
-                )
-            except Exception as e:
-                log.warning("notify owner failed: %s", e)
-
+                await bot.send_message(inv["owner_id"],
+                    f"✅ Оплата получена. Баланс: {nb:.4f} USDT")
+            except: pass
     return web.json_response({"ok": True})
-
-
-async def health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "pet-bot"})
 
 
 # ============ запуск ============
@@ -1072,19 +849,26 @@ async def start_web_server():
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_post("/webhook/xrocket", xrocket_webhook)
+    # API для Mini App
+    app.router.add_get("/api/quests", api_quests_list)
+    app.router.add_post("/api/quest/claim", api_quest_claim)
+    app.router.add_get("/api/inventory", api_inventory_list)
+    app.router.add_post("/api/inventory/buy", api_inventory_buy)
+    app.router.add_post("/api/inventory/use", api_inventory_use)
+    app.router.add_post("/api/mouse/done", api_mouse_done)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Web server listening on port %s", PORT)
+    log.info("Web server on port %s", PORT)
 
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
-    log.info("Bot @%s started (admin ids: %s)", me.username, ADMIN_IDS)
-
+    log.info("Bot @%s started", me.username)
     await start_web_server()
+    asyncio.create_task(notify_loop())
     await dp.start_polling(bot)
 
 
