@@ -256,6 +256,7 @@ async def cmd_start(message: Message):
         "👋 Бот общего питомца.\n\n"
         "Создай питомца — получишь ссылку для друзей.\n\n"
         "В группе можно управлять питомцем командами:\n"
+        "<code>/pet help</code> — справка по всем командам\n"
         "<code>/pet имя покормить</code>\n"
         "<code>/pet имя погладить</code>\n"
         "<code>/pet имя играть</code>\n"
@@ -482,6 +483,7 @@ PET_ALIASES = {
     "помыть":"wash","помой":"wash","мыть":"wash","купать":"wash","искупать":"wash","wash":"wash",
     "лечить":"heal","полечить":"heal","вылечить":"heal","heal":"heal","лечение":"heal",
     "инфо":"info","статы":"info","stats":"info","информация":"info",
+    "кд":"kd","kd":"kd","кулдаун":"kd","кулдауны":"kd","cooldown":"kd","cooldowns":"kd","таймер":"kd",
 }
 
 PET_STAGE_NAMES = {
@@ -557,9 +559,88 @@ async def _send_pet_info(message, pet):
         f"<code>/pet {pet['name']} погладить</code>\n"
         f"<code>/pet {pet['name']} играть</code>\n"
         f"<code>/pet {pet['name']} помыть</code>\n"
-        f"<code>/pet {pet['name']} лечить</code>"
+        f"<code>/pet {pet['name']} лечить</code>\n\n"
+        f"<code>/pet {pet['name']} kd</code> — кулдауны"
     )
     await message.answer(text, parse_mode="HTML")
+
+
+async def _send_pet_help(message):
+    await message.answer(
+        "🐾 <b>Управление питомцем в чате</b>\n\n"
+        "<b>Команды:</b>\n"
+        "<code>/pet</code> — список твоих питомцев\n"
+        "<code>/pet ИМЯ</code> — показать статы\n"
+        "<code>/pet ИМЯ kd</code> — кулдауны на действия\n"
+        "<code>/pet ИМЯ покормить</code> — +25 сытости, +10 энергии\n"
+        "<code>/pet ИМЯ погладить</code> — +10 настроения\n"
+        "<code>/pet ИМЯ играть</code> — +20 настроения, −15 энергии\n"
+        "<code>/pet ИМЯ помыть</code> — +30 чистоты\n"
+        "<code>/pet ИМЯ лечить</code> — +20 здоровья (30 очков)\n\n"
+        "<b>Синонимы:</b> покорми=покормить=feed, поиграй=играть=play, кд=кулдаун=cooldown\n\n"
+        "<b>Кулдауны:</b>\n"
+        "🍖 покормить — 5 мин\n"
+        "✋ погладить — 1 мин\n"
+        "🎾 играть — 10 мин\n"
+        "🧼 помыть — 15 мин\n"
+        "💊 лечить — 1 час\n\n"
+        "Очки и XP идут в общий счёт питомца и в топ.",
+        parse_mode="HTML"
+    )
+
+
+async def _send_pet_kd(message, pet, user):
+    """Показать кулдауны пользователя на действия с питомцем."""
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", user.id))
+    if not mem:
+        await message.answer("Ты не участник этого питомца. Открой ссылку-приглашение.")
+        return
+
+    now = datetime.now(timezone.utc)
+    lines = [f"⏱ <b>Кулдауны на {escape_html(pet['name'])}</b>"]
+    uname = escape_html(user.first_name or "Гость")
+    lines.append(f"<i>для {uname}</i>\n")
+
+    any_cd = False
+    for key in ("feed", "pet", "play", "wash", "heal"):
+        cfg = PET_ACTIONS[key]
+        last_str = mem.get("last_" + key + "_at")
+        emoji = cfg["emoji"]
+        label = cfg["label"]
+
+        if not last_str:
+            lines.append(f"{emoji} {label} — <b>готово</b>")
+            continue
+
+        try:
+            last_dt = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
+        except Exception:
+            lines.append(f"{emoji} {label} — <b>готово</b>")
+            continue
+
+        passed = (now - last_dt).total_seconds()
+        left = cfg["cd"] - passed
+
+        if left <= 0:
+            lines.append(f"{emoji} {label} — <b>готово</b>")
+        else:
+            any_cd = True
+            mm = int(left // 60)
+            ss = int(left % 60)
+            if mm >= 60:
+                hh = mm // 60
+                mm = mm % 60
+                t = f"{hh} ч {mm} мин"
+            elif mm > 0:
+                t = f"{mm} мин {ss} сек"
+            else:
+                t = f"{ss} сек"
+            lines.append(f"{emoji} {label} — ⏳ <b>{t}</b>")
+
+    if not any_cd:
+        lines.append("\n✨ <b>Все действия доступны!</b>")
+
+    await message.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("pet"))
@@ -567,6 +648,11 @@ async def cmd_pet(message: Message):
     user = message.from_user
     parts = (message.text or "").split()
     args = parts[1:] if len(parts) > 1 else []
+
+    # /pet help — справка
+    if args and args[0].lower() in ("help", "помощь", "хелп", "?", "справка"):
+        await _send_pet_help(message)
+        return
 
     if not args:
         members = await many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
@@ -578,6 +664,7 @@ async def cmd_pet(message: Message):
             p = m.get("pets") or {}
             lvl = min(30, (p.get("xp") or 0) // 50 + 1)
             lines.append(f"• <b>{p['name']}</b> · ур. {lvl}\n  <code>/pet {p['name']}</code>")
+        lines.append("\n<code>/pet help</code> — справка")
         await message.answer("\n".join(lines), parse_mode="HTML")
         return
 
@@ -616,11 +703,15 @@ async def cmd_pet(message: Message):
     if action == "info":
         await _send_pet_info(message, pet)
         return
+    if action == "kd":
+        await _send_pet_kd(message, pet, user)
+        return
     if not action:
         await message.answer(
             f"Не понимаю действие «{escape_html(action_key)}».\n\n"
-            f"<b>Что можно:</b> покормить · погладить · играть · помыть · лечить\n"
-            f"Например: <code>/pet {escape_html(pet['name'])} покормить</code>",
+            f"<b>Что можно:</b> покормить · погладить · играть · помыть · лечить · kd\n"
+            f"Например: <code>/pet {escape_html(pet['name'])} покормить</code>\n\n"
+            f"Справка: <code>/pet help</code>",
             parse_mode="HTML"
         )
         return
@@ -1062,11 +1153,13 @@ async def cmd_help(m: Message):
         "🐾 <b>Игра про общего питомца</b>\n\n"
         "• /start — создать питомца\n"
         "• /pet — мои питомцы\n"
-        "• /pet имя покормить — покормить питомца\n"
+        "• /pet help — справка по командам\n"
+        "• /pet имя покормить — покормить\n"
         "• /pet имя погладить — погладить\n"
         "• /pet имя играть — поиграть\n"
         "• /pet имя помыть — помыть\n"
-        "• /pet имя лечить — полечить (30 очков)",
+        "• /pet имя лечить — полечить (30 очков)\n"
+        "• /pet имя kd — кулдауны",
         parse_mode="HTML")
 
 
