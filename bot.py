@@ -28,34 +28,19 @@ PORT          = int(os.environ.get("PORT", 8080))
 
 ADMIN_IDS = {8130244626}
 MIN_CHEQUE = 0.01
-NOTIFY_COOLDOWN_HOURS = 3
 
-QUEST_TEMPLATES = [
-    {"type": "feed_3",   "target": 3, "reward": 5,  "text": "Покормить 3 раза",     "emoji": "🍖"},
-    {"type": "pet_5",    "target": 5, "reward": 3,  "text": "Погладить 5 раз",       "emoji": "✋"},
-    {"type": "play_2",   "target": 2, "reward": 8,  "text": "Поиграть 2 раза",       "emoji": "🎾"},
-    {"type": "wash_1",   "target": 1, "reward": 5,  "text": "Помыть 1 раз",          "emoji": "🧼"},
-    {"type": "all_acts", "target": 4, "reward": 15, "text": "Сделать 4 разных дела", "emoji": "🌟"},
-]
+# Скины (для админ-команды; основной список в index.html)
+SKINS = ["classic", "cat", "dragon", "space", "dino"]
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
-ITEM_PRICES = {"food": 5, "toy": 8, "medicine": 15, "hat": 30}
-ITEM_EFFECTS = {
-    "food":     {"hunger": 30, "energy": 15},
-    "toy":      {"mood": 30},
-    "medicine": {"health": 40},
-    "hat":      {},
-}
-
 
 def is_admin(uid): return uid in ADMIN_IDS
 def gen_code(n=6): return "".join(random.choice(CODE_CHARS) for _ in range(n))
 def webapp_url(pid): return f"{WEBAPP_URL}?pet={pid}"
-def escape_html(s): return str(s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
 
 def pick_link(obj):
@@ -161,47 +146,6 @@ def xrocket_error_text(e):
     return f"⚠️ xRocket {getattr(e,'status','?')}: {title or detail}"
 
 
-# ============ КВЕСТЫ ============
-
-def ensure_quests(pet_id, user_id):
-    today = date.today().isoformat()
-    existing = many(sb.table("quests").select("*")
-                    .eq("pet_id", pet_id).eq("user_id", user_id).eq("quest_date", today))
-    if existing: return existing
-    created = []
-    for t in QUEST_TEMPLATES:
-        r = sb.table("quests").insert({
-            "pet_id": pet_id, "user_id": user_id, "quest_date": today,
-            "quest_type": t["type"], "target": t["target"], "progress": 0,
-        }).execute()
-        if r.data: created.append(r.data[0])
-    return created
-
-
-def quest_action_type(action):
-    return {"feed":"feed_3", "pet":"pet_5", "play":"play_2", "wash":"wash_1"}.get(action)
-
-
-def quest_progress_update(pet_id, user_id, action):
-    today = date.today().isoformat()
-    ensure_quests(pet_id, user_id)
-    qt = quest_action_type(action)
-    if qt:
-        q = one(sb.table("quests").select("*").eq("pet_id", pet_id).eq("user_id", user_id)
-                .eq("quest_date", today).eq("quest_type", qt))
-        if q and q["progress"] < q["target"]:
-            sb.table("quests").update({"progress": q["progress"] + 1}).eq("id", q["id"]).execute()
-    acts = many(sb.table("events").select("action").eq("pet_id", pet_id).eq("user_id", user_id)
-                .gte("created_at", today + "T00:00:00"))
-    unique_acts = len({a["action"] for a in acts if a["action"] in ("feed","pet","play","wash")})
-    q_all = one(sb.table("quests").select("*").eq("pet_id", pet_id).eq("user_id", user_id)
-                .eq("quest_date", today).eq("quest_type", "all_acts"))
-    if q_all:
-        new_progress = min(unique_acts, q_all["target"])
-        if new_progress != q_all["progress"]:
-            sb.table("quests").update({"progress": new_progress}).eq("id", q_all["id"]).execute()
-
-
 # ============ /start ============
 
 @dp.message(CommandStart())
@@ -253,7 +197,7 @@ async def cmd_start(message: Message):
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"💳 Оплатить {amount}", url=link)],
             [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{iid}")]])
-        await message.answer(f"💳 Счёт на {amount}. После оплаты жми «Проверить».", reply_markup=kb); return
+        await message.answer(f"💳 Счёт на {amount}.", reply_markup=kb); return
 
     if payload.startswith("salary_"):
         parts = payload[7:].split("_")
@@ -267,43 +211,6 @@ async def cmd_start(message: Message):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🐣 Создать питомца", callback_data="create")],
             [InlineKeyboardButton(text="📋 Мои питомцы", callback_data="my_pets")]]))
-
-
-# ============ уведомления ============
-
-async def notify_loop():
-    while True:
-        try:
-            pets = many(sb.table("pets").select("*"))
-            now = datetime.now(timezone.utc)
-            for p in pets:
-                last = p.get("last_notified_at")
-                if last:
-                    try:
-                        last_dt = datetime.fromisoformat(last.replace("Z","+00:00"))
-                        if (now - last_dt).total_seconds() < NOTIFY_COOLDOWN_HOURS * 3600:
-                            continue
-                    except: pass
-                msgs = []
-                if p.get("hunger",100) < 30: msgs.append("🍖 Я голоден!")
-                if p.get("mood",100) < 30:   msgs.append("😢 Мне скучно…")
-                if p.get("clean",100) < 30:  msgs.append("🧼 Я грязный…")
-                if p.get("energy",100) < 20: msgs.append("💤 Я устал…")
-                if p.get("health",100) < 30: msgs.append("💔 Мне плохо!")
-                if not msgs: continue
-                text = f"🐾 <b>Питомец «{escape_html(p['name'])}»</b>\n\n" + "\n".join(msgs)
-                text += "\n\nОткрой приложение и позаботься о нём."
-                kb = InlineKeyboardMarkup(inline_keyboard=[
-                    [InlineKeyboardButton(text="🐾 Открыть питомца",
-                                          web_app=WebAppInfo(url=webapp_url(p["id"])))]])
-                try:
-                    await bot.send_message(p["owner_id"], text, parse_mode="HTML", reply_markup=kb)
-                    sb.table("pets").update({"last_notified_at": now.isoformat()}).eq("id", p["id"]).execute()
-                except Exception as e:
-                    log.warning("notify %s: %s", p["owner_id"], e)
-        except Exception as e:
-            log.error("notify_loop: %s", e)
-        await asyncio.sleep(3600)
 
 
 # ============ проверка оплаты ============
@@ -466,18 +373,20 @@ async def cmd_admin(m: Message):
     await m.answer(
         "🛠 <b>Админка</b>\n\n"
         "<b>Очки:</b>\n"
-        "/addscore 100 — начислить себе очки\n"
-        "/setscore &lt;uid&gt; 100 — установить очки юзеру\n\n"
+        "/addscore 100 — начислить себе\n"
+        "/setscore &lt;uid&gt; 100 — установить юзеру\n\n"
         "<b>Баланс:</b>\n"
         "/setbal 5 — своему питомцу\n"
         "/addbal 1 — прибавить\n"
         "/setbal_pet &lt;id&gt; 5 — питомцу по ID\n"
         "/addbal_pet &lt;id&gt; 1 — прибавить по ID\n"
         "/list_pets — все питомцы\n\n"
-        "<b>Прочее:</b>\n"
+        "<b>Питомец:</b>\n"
         "/addxp 200 — добавить XP\n"
-        "/reset_scores — обнулить дневные очки\n"
-        "/cheques — активные чеки\n"
+        "/setskin classic — сменить скин (classic/cat/dragon/space/dino)\n"
+        "/reset_scores — обнулить дневные очки\n\n"
+        "<b>Чеки:</b>\n"
+        "/cheques — активные\n"
         "/cancel_cheques — отменить все\n"
         "/xr — баланс xRocket",
         parse_mode="HTML")
@@ -487,15 +396,13 @@ async def cmd_admin(m: Message):
 async def cmd_addscore(m: Message):
     if not is_admin(m.from_user.id): return
     parts = m.text.split()
-    if len(parts) < 2:
-        await m.answer("Формат: /addscore 100"); return
+    if len(parts) < 2: await m.answer("Формат: /addscore 100"); return
     try: amount = int(parts[1])
     except: await m.answer("Не число."); return
     pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
     if not pet: await m.answer("Нет питомца."); return
     mem = one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", m.from_user.id))
-    if not mem:
-        await m.answer("Ты не участник."); return
+    if not mem: await m.answer("Ты не участник."); return
     new_score = (mem.get("score") or 0) + amount
     sb.table("members").update({"score": new_score})\
       .eq("pet_id", pet["id"]).eq("user_id", m.from_user.id).execute()
@@ -506,8 +413,7 @@ async def cmd_addscore(m: Message):
 async def cmd_setscore(m: Message):
     if not is_admin(m.from_user.id): return
     parts = m.text.split()
-    if len(parts) < 3:
-        await m.answer("Формат: /setscore <uid> 100"); return
+    if len(parts) < 3: await m.answer("Формат: /setscore <uid> 100"); return
     try: uid = int(parts[1]); amount = int(parts[2])
     except: await m.answer("Не число."); return
     pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
@@ -578,11 +484,11 @@ async def cmd_addbal_pet(m: Message):
 @dp.message(Command("list_pets"))
 async def cmd_list_pets(m: Message):
     if not is_admin(m.from_user.id): return
-    pets = many(sb.table("pets").select("id,name,owner_id,bank_balance,xp"))
+    pets = many(sb.table("pets").select("id,name,owner_id,bank_balance,xp,skin"))
     if not pets: await m.answer("Нет питомцев."); return
     lines = ["🐾 <b>Питомцы:</b>\n"]
     for p in pets[:30]:
-        lines.append(f"• <code>{p['id']}</code>\n  {p['name']} — {float(p.get('bank_balance') or 0):.4f}, XP {p.get('xp') or 0}")
+        lines.append(f"• <code>{p['id']}</code>\n  {p['name']} [{p.get('skin','classic')}] — {float(p.get('bank_balance') or 0):.4f}, XP {p.get('xp') or 0}")
     await m.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -604,6 +510,21 @@ async def cmd_addxp(m: Message):
     t = f"✅ XP: {ox} → {nx} (ур. {ol} → {nl})"
     if ns != os: t += f"\n✨ {names[os]} → {names[ns]}"
     await m.answer(t)
+
+
+@dp.message(Command("setskin"))
+async def cmd_setskin(m: Message):
+    if not is_admin(m.from_user.id): return
+    parts = m.text.split()
+    if len(parts) < 2:
+        await m.answer("Формат: /setskin classic|cat|dragon|space|dino"); return
+    skin = parts[1].lower()
+    if skin not in SKINS:
+        await m.answer(f"Доступные скины: {', '.join(SKINS)}"); return
+    pet = one(sb.table("pets").select("*").eq("owner_id", m.from_user.id))
+    if not pet: await m.answer("Нет питомца."); return
+    sb.table("pets").update({"skin": skin}).eq("id", pet["id"]).execute()
+    await m.answer(f"✅ Скин «{skin}» установлен")
 
 
 @dp.message(Command("reset_scores"))
@@ -724,113 +645,7 @@ async def cmd_help(m: Message):
     await m.answer("🐾 Игра про общего питомца. /start чтобы начать.")
 
 
-# ============ API ============
-
-async def api_quests_list(request: web.Request):
-    pid = request.query.get("pet_id"); uid = request.query.get("user_id")
-    if not all([pid, uid]): return web.json_response({"error": "missing"}, status=400)
-    ensure_quests(pid, int(uid))
-    today = date.today().isoformat()
-    qs = many(sb.table("quests").select("*").eq("pet_id", pid).eq("user_id", int(uid)).eq("quest_date", today))
-    return web.json_response({"quests": qs})
-
-
-async def api_quest_claim(request: web.Request):
-    try: data = await request.json()
-    except: return web.json_response({"error": "bad json"}, status=400)
-    qid = data.get("quest_id")
-    if not qid: return web.json_response({"error": "no quest_id"}, status=400)
-    q = one(sb.table("quests").select("*").eq("id", qid))
-    if not q: return web.json_response({"error": "not found"}, status=404)
-    if q["progress"] < q["target"]: return web.json_response({"error": "not completed"}, status=400)
-    if q["claimed"]: return web.json_response({"error": "already"}, status=400)
-    tmpl = next((t for t in QUEST_TEMPLATES if t["type"] == q["quest_type"]), None)
-    reward = tmpl["reward"] if tmpl else 5
-    m = one(sb.table("members").select("*").eq("pet_id", q["pet_id"]).eq("user_id", q["user_id"]))
-    if m:
-        sb.table("members").update({"score": (m.get("score") or 0) + reward})\
-          .eq("pet_id", q["pet_id"]).eq("user_id", q["user_id"]).execute()
-    sb.table("quests").update({"claimed": True}).eq("id", qid).execute()
-    return web.json_response({"ok": True, "reward": reward})
-
-
-async def api_inventory_list(request: web.Request):
-    pid = request.query.get("pet_id"); uid = request.query.get("user_id")
-    if not all([pid, uid]): return web.json_response({"error": "missing"}, status=400)
-    inv = many(sb.table("inventory").select("*").eq("pet_id", pid).eq("user_id", int(uid)))
-    return web.json_response({"items": inv})
-
-
-async def api_inventory_buy(request: web.Request):
-    try: data = await request.json()
-    except: return web.json_response({"error": "bad json"}, status=400)
-    pid = data.get("pet_id"); uid = data.get("user_id"); itype = data.get("item_type")
-    if not all([pid, uid, itype]): return web.json_response({"error": "missing"}, status=400)
-    if itype not in ITEM_PRICES: return web.json_response({"error": "unknown"}, status=400)
-    price = ITEM_PRICES[itype]
-    m = one(sb.table("members").select("*").eq("pet_id", pid).eq("user_id", uid))
-    if not m or (m.get("score") or 0) < price:
-        return web.json_response({"error": "not enough score"}, status=400)
-    sb.table("members").update({"score": m["score"] - price})\
-      .eq("pet_id", pid).eq("user_id", uid).execute()
-    inv = one(sb.table("inventory").select("*").eq("pet_id", pid).eq("user_id", uid).eq("item_type", itype))
-    if inv:
-        sb.table("inventory").update({"count": (inv.get("count") or 0) + 1})\
-          .eq("pet_id", pid).eq("user_id", uid).eq("item_type", itype).execute()
-    else:
-        sb.table("inventory").insert({"pet_id": pid, "user_id": uid, "item_type": itype, "count": 1}).execute()
-    return web.json_response({"ok": True, "new_score": m["score"] - price})
-
-
-async def api_inventory_use(request: web.Request):
-    try: data = await request.json()
-    except: return web.json_response({"error": "bad json"}, status=400)
-    pid = data.get("pet_id"); uid = data.get("user_id"); itype = data.get("item_type")
-    if not all([pid, uid, itype]): return web.json_response({"error": "missing"}, status=400)
-    inv = one(sb.table("inventory").select("*").eq("pet_id", pid).eq("user_id", uid).eq("item_type", itype))
-    if not inv or (inv.get("count") or 0) <= 0:
-        return web.json_response({"error": "no item"}, status=400)
-    pet = one(sb.table("pets").select("*").eq("id", pid))
-    if not pet: return web.json_response({"error": "pet not found"}, status=404)
-    eff = ITEM_EFFECTS.get(itype, {})
-    upd = {}
-    for k, v in eff.items():
-        upd[k] = max(0, min(100, (pet.get(k) or 0) + v))
-    if upd: sb.table("pets").update(upd).eq("id", pid).execute()
-    if itype != "hat":
-        sb.table("inventory").update({"count": inv["count"] - 1})\
-          .eq("pet_id", pid).eq("user_id", uid).eq("item_type", itype).execute()
-    return web.json_response({"ok": True, "effects": upd})
-
-
-async def api_mouse_done(request: web.Request):
-    try: data = await request.json()
-    except: return web.json_response({"error": "bad json"}, status=400)
-    pid = data.get("pet_id"); uid = data.get("user_id"); caught = data.get("caught", 0)
-    if not all([pid, uid]): return web.json_response({"error": "missing"}, status=400)
-    m = one(sb.table("members").select("*").eq("pet_id", pid).eq("user_id", uid))
-    if not m: return web.json_response({"error": "no member"}, status=400)
-    last = m.get("last_mouse_at")
-    if last:
-        try:
-            last_dt = datetime.fromisoformat(last.replace("Z","+00:00"))
-            if (datetime.now(timezone.utc) - last_dt).total_seconds() < 3600:
-                return web.json_response({"error": "cooldown"}, status=400)
-        except: pass
-    sb.table("members").update({"last_mouse_at": datetime.now(timezone.utc).isoformat()})\
-      .eq("pet_id", pid).eq("user_id", uid).execute()
-    reward = 0
-    if caught:
-        reward = 3
-        sb.table("members").update({"score": (m.get("score") or 0) + reward})\
-          .eq("pet_id", pid).eq("user_id", uid).execute()
-        pet = one(sb.table("pets").select("*").eq("id", pid))
-        if pet:
-            nx = (pet.get("xp") or 0) + 2
-            sb.table("pets").update({"xp": nx, "mood": min(100, (pet.get("mood") or 0) + 5)})\
-              .eq("id", pid).execute()
-    return web.json_response({"ok": True, "reward": reward})
-
+# ============ health + webhook ============
 
 async def health(request: web.Request):
     return web.json_response({"ok": True, "service": "pet-bot"})
@@ -862,12 +677,6 @@ async def start_web_server():
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_post("/webhook/xrocket", xrocket_webhook)
-    app.router.add_get("/api/quests", api_quests_list)
-    app.router.add_post("/api/quest/claim", api_quest_claim)
-    app.router.add_get("/api/inventory", api_inventory_list)
-    app.router.add_post("/api/inventory/buy", api_inventory_buy)
-    app.router.add_post("/api/inventory/use", api_inventory_use)
-    app.router.add_post("/api/mouse/done", api_mouse_done)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
@@ -880,7 +689,6 @@ async def main():
     me = await bot.get_me()
     log.info("Bot @%s started (admins: %s)", me.username, ADMIN_IDS)
     await start_web_server()
-    asyncio.create_task(notify_loop())
     await dp.start_polling(bot)
 
 
