@@ -39,6 +39,24 @@ def webapp_url(pet_id: str) -> str:
     return f"{WEBAPP_URL}?pet={pet_id}"
 
 
+def pick_link(obj: dict) -> str | None:
+    """Ищет ссылку в разных возможных местах ответа xRocket."""
+    if not obj:
+        return None
+    if isinstance(obj, dict):
+        for key in ("link", "url", "webLink", "botLink", "miniAppLink"):
+            v = obj.get(key)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
+        links = obj.get("links") or {}
+        if isinstance(links, dict):
+            for key in ("webLink", "telegramMiniAppLink", "botLink", "link", "url"):
+                v = links.get(key)
+                if isinstance(v, str) and v.startswith("http"):
+                    return v
+    return None
+
+
 # ============ xRocket helpers ============
 
 async def xrocket_request(method: str, path: str, json: dict | None = None) -> dict:
@@ -49,7 +67,11 @@ async def xrocket_request(method: str, path: str, json: dict | None = None) -> d
     }
     async with aiohttp.ClientSession() as session:
         async with session.request(method, url, headers=headers, json=json, timeout=30) as resp:
-            data = await resp.json()
+            raw = await resp.text()
+            try:
+                data = await resp.json()
+            except Exception:
+                data = {"raw": raw}
             if resp.status >= 400:
                 log.error("xRocket error %s: %s", resp.status, data)
                 raise RuntimeError(f"xRocket {resp.status}: {data}")
@@ -57,25 +79,31 @@ async def xrocket_request(method: str, path: str, json: dict | None = None) -> d
 
 
 async def create_invoice(amount: float, currency: str, description: str) -> dict:
+    """Создать инвойс для пополнения банка."""
     payload = {
-        "priceAmount": str(amount),
-        "priceCurrency": currency,
+        "amount": str(amount),
+        "currency": currency,
         "description": description,
-        "numPayments": 1,
-        "expiresIn": 3600000,
+        "hiddenMessage": "Спасибо! Банк питомца пополнен.",
+        "commentsEnabled": False,
     }
-    return await xrocket_request("POST", "/api/v1/invoices", payload)
+    data = await xrocket_request("POST", "/api/v1/invoices", payload)
+    log.info("xRocket invoice response: %s", data)
+    return data
 
 
 async def create_cheque(user_id: int, amount: float, currency: str, description: str) -> dict:
+    """Создать персональный чек для участника."""
     payload = {
         "amount": str(amount),
-        "asset": currency,
+        "currency": currency,
         "description": description,
         "targetType": "telegram_user_id",
         "target": str(user_id),
     }
-    return await xrocket_request("POST", "/api/v1/cheques", payload)
+    data = await xrocket_request("POST", "/api/v1/cheques", payload)
+    log.info("xRocket cheque response: %s", data)
+    return data
 
 
 # ============ /start ============
@@ -130,7 +158,15 @@ async def cmd_start(message: Message):
             await message.answer(f"Не удалось создать счёт.\n{e}")
             return
 
-        link = (invoice.get("links") or {}).get("webLink") or invoice.get("link")
+        link = pick_link(invoice)
+        if not link:
+            await message.answer(
+                "⚠️ xRocket вернул инвойс без ссылки.\n\n"
+                "Ответ API:\n<code>" + str(invoice)[:800] + "</code>",
+                parse_mode="HTML"
+            )
+            return
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="💳 Оплатить 1 USDT", url=link)],
             [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"topup_confirm_{pet_id}")],
@@ -157,14 +193,10 @@ async def cmd_start(message: Message):
     )
 
 
-# ============ /salary как команда ============
-
 @dp.message(Command("salary"))
 async def cmd_salary(message: Message):
     await run_salary(message.from_user.id, message)
 
-
-# ============ Логика зарплаты ============
 
 async def run_salary(owner_id: int, message: Message):
     pet_res = sb.table("pets").select("*").eq("owner_id", owner_id).maybe_single().execute()
@@ -224,7 +256,7 @@ async def run_salary(owner_id: int, message: Message):
                 description=f"Зарплата за активность ({score} очков)"
             )
             cheque_id = cheque.get("chequeId") or cheque.get("id")
-            link = (cheque.get("links") or {}).get("telegramMiniAppLink") or cheque.get("link")
+            link = pick_link(cheque)
 
             sb.table("cheques").insert({
                 "payout_id": payout["id"],
@@ -233,8 +265,12 @@ async def run_salary(owner_id: int, message: Message):
                 "amount": share,
                 "cheque_id": cheque_id,
                 "cheque_link": link,
-                "status": "sent",
+                "status": "sent" if link else "no_link",
             }).execute()
+
+            if not link:
+                log.warning("cheque without link: %s", cheque)
+                continue
 
             try:
                 await bot.send_message(
@@ -285,7 +321,10 @@ async def cb_topup_confirm(call: CallbackQuery):
     sb.table("pets").update({"bank_balance": new_balance}).eq("id", pet_id).execute()
 
     await call.answer("Банк пополнен!")
-    await call.message.edit_text(f"✅ Банк пополнен. Баланс: {new_balance:.2f} USDT")
+    try:
+        await call.message.edit_text(f"✅ Банк пополнен. Баланс: {new_balance:.2f} USDT")
+    except Exception:
+        pass
 
 
 # ============ create ============
