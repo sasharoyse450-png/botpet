@@ -63,6 +63,29 @@ def pick_link(obj: dict) -> str | None:
     return None
 
 
+def one(query):
+    """Безопасная замена .maybe_single() — возвращает dict или None."""
+    try:
+        res = query.limit(1).execute()
+        data = getattr(res, "data", None) or []
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data if data else None
+    except Exception as e:
+        log.warning("one() query failed: %s", e)
+        return None
+
+
+def many(query):
+    """Безопасный список."""
+    try:
+        res = query.execute()
+        return getattr(res, "data", None) or []
+    except Exception as e:
+        log.warning("many() query failed: %s", e)
+        return []
+
+
 # ============ xRocket helpers ============
 
 async def xrocket_request(method: str, path: str, json: dict | None = None) -> dict:
@@ -145,8 +168,7 @@ async def cmd_start(message: Message):
 
     if payload.startswith("join_"):
         code = payload[5:]
-        res = sb.table("pets").select("*").eq("invite_code", code).maybe_single().execute()
-        pet = res.data if res else None
+        pet = one(sb.table("pets").select("*").eq("invite_code", code))
         if not pet:
             await message.answer("Питомец не найден или ссылка устарела.")
             return
@@ -173,8 +195,7 @@ async def cmd_start(message: Message):
             await message.answer("Некорректная сумма.")
             return
 
-        pet_res = sb.table("pets").select("*").eq("id", pet_id).maybe_single().execute()
-        pet = pet_res.data if pet_res else None
+        pet = one(sb.table("pets").select("*").eq("id", pet_id))
         if not pet:
             await message.answer("Питомец не найден.")
             return
@@ -219,8 +240,7 @@ async def cmd_start(message: Message):
         ])
         await message.answer(
             f"💳 Счёт на {amount} {pet.get('currency','USDT')} для банка питомца.\n\n"
-            f"Оплати по кнопке выше. После оплаты нажми «Проверить оплату» — "
-            f"баланс начислится автоматически.",
+            f"Оплати по кнопке выше. После оплаты нажми «Проверить оплату».",
             reply_markup=kb
         )
         return
@@ -281,8 +301,7 @@ async def cb_check_payment(call: CallbackQuery):
     invoice_id = call.data[6:]
     user = call.from_user
 
-    inv_res = sb.table("invoices").select("*").eq("invoice_id", invoice_id).maybe_single().execute()
-    inv = inv_res.data if inv_res else None
+    inv = one(sb.table("invoices").select("*").eq("invoice_id", invoice_id))
     if not inv:
         await call.answer("Инвойс не найден", show_alert=True)
         return
@@ -313,8 +332,7 @@ async def cb_check_payment(call: CallbackQuery):
     ).lower()
 
     if status in ("paid", "success", "completed", "paid_success"):
-        pet_res = sb.table("pets").select("*").eq("id", inv["pet_id"]).maybe_single().execute()
-        pet = pet_res.data if pet_res else None
+        pet = one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
         if pet:
             new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
             sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
@@ -338,8 +356,7 @@ async def cb_check_payment(call: CallbackQuery):
 
 @dp.message(Command("balance"))
 async def cmd_balance(message: Message):
-    pet_res = sb.table("pets").select("*").eq("owner_id", message.from_user.id).maybe_single().execute()
-    pet = pet_res.data if pet_res else None
+    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
     if not pet:
         await message.answer("У тебя нет питомца, где ты владелец.")
         return
@@ -353,15 +370,14 @@ async def cmd_balance(message: Message):
 @dp.message(Command("topup"))
 async def cmd_topup(message: Message):
     user = message.from_user
-    pet_res = sb.table("pets").select("*").eq("owner_id", user.id).maybe_single().execute()
-    pet = pet_res.data if pet_res else None
+    pet = one(sb.table("pets").select("*").eq("owner_id", user.id))
     if not pet:
         await message.answer("У тебя нет питомца, где ты владелец.")
         return
 
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("Использование: /topup 1  (или /topup 0.5)")
+        await message.answer("Использование: /topup 1")
         return
     try:
         amount = float(parts[1].replace(",", "."))
@@ -412,8 +428,7 @@ async def cmd_topup(message: Message):
 @dp.message(Command("salary"))
 async def cmd_salary(message: Message):
     user = message.from_user
-    pet_res = sb.table("pets").select("*").eq("owner_id", user.id).maybe_single().execute()
-    pet = pet_res.data if pet_res else None
+    pet = one(sb.table("pets").select("*").eq("owner_id", user.id))
     if not pet:
         await message.answer("У тебя нет питомца, где ты владелец.")
         return
@@ -431,15 +446,14 @@ async def cmd_salary(message: Message):
         try:
             top_n = int(parts[2])
         except ValueError:
-            await message.answer("Не могу разобрать топ-N. Пример: /salary 1 3")
+            await message.answer("Не могу разобрать топ-N.")
             return
 
     await run_salary_pet(pet["id"], user.id, amount, top_n, message)
 
 
 async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n: int | None, message: Message):
-    pet_res = sb.table("pets").select("*").eq("id", pet_id).maybe_single().execute()
-    pet = pet_res.data if pet_res else None
+    pet = one(sb.table("pets").select("*").eq("id", pet_id))
     if not pet:
         await message.answer("Питомец не найден.")
         return
@@ -459,8 +473,7 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         return
 
     today = date.today().isoformat()
-    members_res = sb.table("members").select("*").eq("pet_id", pet["id"]).execute()
-    members = members_res.data or []
+    members = many(sb.table("members").select("*").eq("pet_id", pet["id"]))
 
     for m in members:
         if m.get("today_date") != today:
@@ -485,11 +498,10 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         await message.answer("Нет очков для распределения.")
         return
 
-    # Пробный чек первому — если xRocket отключил, ничего не спишем
     test_winner = winners[0]
     test_share = round(amount * (test_winner["today_score"] / total_score), 6)
     if test_share < 0.01:
-        await message.answer("Доли слишком малы для чеков (минимум 0.01 USDT). Увеличь сумму.")
+        await message.answer("Доли слишком малы (минимум 0.01 USDT). Увеличь сумму.")
         return
 
     try:
@@ -594,10 +606,10 @@ async def cmd_admin(message: Message):
         return
     await message.answer(
         "🛠 <b>Админ-команды</b>\n\n"
-        "/setbal 5 — установить баланс банка (своему питомцу)\n"
+        "/setbal 5 — установить баланс (своему питомцу)\n"
         "/addbal 1 — прибавить к балансу\n"
-        "/setbal_pet &lt;pet_id&gt; 5 — установить баланс конкретному питомцу\n"
-        "/addbal_pet &lt;pet_id&gt; 1 — прибавить конкретному питомцу\n"
+        "/setbal_pet &lt;pet_id&gt; 5 — установить баланс питомцу по ID\n"
+        "/addbal_pet &lt;pet_id&gt; 1 — прибавить питомцу по ID\n"
         "/list_pets — все питомцы с балансами\n"
         "/reset_scores — обнулить today_score у всех",
         parse_mode="HTML"
@@ -617,8 +629,7 @@ async def cmd_setbal(message: Message):
     except ValueError:
         await message.answer("Не могу разобрать сумму.")
         return
-    pet_res = sb.table("pets").select("*").eq("owner_id", message.from_user.id).maybe_single().execute()
-    pet = pet_res.data if pet_res else None
+    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
     if not pet:
         await message.answer("У тебя нет питомца.")
         return
@@ -639,8 +650,7 @@ async def cmd_addbal(message: Message):
     except ValueError:
         await message.answer("Не могу разобрать сумму.")
         return
-    pet_res = sb.table("pets").select("*").eq("owner_id", message.from_user.id).maybe_single().execute()
-    pet = pet_res.data if pet_res else None
+    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
     if not pet:
         await message.answer("У тебя нет питомца.")
         return
@@ -657,14 +667,17 @@ async def cmd_setbal_pet(message: Message):
     if len(parts) < 3:
         await message.answer("Использование: /setbal_pet <pet_id> 5")
         return
-    pet_id = parts[1]
+    pet_id = parts[1].strip()
     try:
         amount = float(parts[2].replace(",", "."))
     except ValueError:
         await message.answer("Не могу разобрать сумму.")
         return
-    res = sb.table("pets").select("*").eq("id", pet_id).maybe_single().execute()
-    pet = res.data if res else None
+    # проверим, что UUID валидный
+    if len(pet_id) < 30:
+        await message.answer("Похоже, это не UUID. Возьми ID из /list_pets.")
+        return
+    pet = one(sb.table("pets").select("*").eq("id", pet_id))
     if not pet:
         await message.answer("Питомец с таким ID не найден.")
         return
@@ -680,14 +693,16 @@ async def cmd_addbal_pet(message: Message):
     if len(parts) < 3:
         await message.answer("Использование: /addbal_pet <pet_id> 1")
         return
-    pet_id = parts[1]
+    pet_id = parts[1].strip()
     try:
         amount = float(parts[2].replace(",", "."))
     except ValueError:
         await message.answer("Не могу разобрать сумму.")
         return
-    res = sb.table("pets").select("*").eq("id", pet_id).maybe_single().execute()
-    pet = res.data if res else None
+    if len(pet_id) < 30:
+        await message.answer("Похоже, это не UUID. Возьми ID из /list_pets.")
+        return
+    pet = one(sb.table("pets").select("*").eq("id", pet_id))
     if not pet:
         await message.answer("Питомец с таким ID не найден.")
         return
@@ -700,8 +715,7 @@ async def cmd_addbal_pet(message: Message):
 async def cmd_list_pets(message: Message):
     if not is_admin(message.from_user.id):
         return
-    res = sb.table("pets").select("id,name,owner_id,bank_balance,xp").execute()
-    pets = res.data or []
+    pets = many(sb.table("pets").select("id,name,owner_id,bank_balance,xp"))
     if not pets:
         await message.answer("Питомцев нет.")
         return
@@ -766,14 +780,15 @@ async def cb_create(call: CallbackQuery):
 async def cb_my_pets(call: CallbackQuery):
     user = call.from_user
     await call.answer()
-    res = sb.table("members").select("pet_id, score, pets!inner(id, name, xp)").eq("user_id", user.id).order("score", desc=True).limit(20).execute()
-    data = res.data or []
+    data = many(sb.table("members").select("pet_id, score, pets!inner(id, name, xp)").eq("user_id", user.id).order("score", desc=True).limit(20))
     if not data:
         await call.message.answer("У тебя пока нет питомцев.")
         return
     rows = []
     for m in data:
-        p = m["pets"]
+        p = m.get("pets") or {}
+        if not p:
+            continue
         lvl = min(30, (p.get("xp") or 0) // 50 + 1)
         rows.append([InlineKeyboardButton(
             text=f"🐾 {p['name']} · ур. {lvl}",
@@ -813,14 +828,12 @@ async def xrocket_webhook(request: web.Request) -> web.Response:
     if not invoice_id:
         return web.json_response({"ok": True, "ignored": "no invoiceId"})
 
-    inv_res = sb.table("invoices").select("*").eq("invoice_id", str(invoice_id)).maybe_single().execute()
-    inv = inv_res.data if inv_res else None
+    inv = one(sb.table("invoices").select("*").eq("invoice_id", str(invoice_id)))
     if not inv or inv["status"] == "paid":
         return web.json_response({"ok": True})
 
     if any(k in status for k in ("paid", "success", "completed", "invoice_paid")):
-        pet_res = sb.table("pets").select("*").eq("id", inv["pet_id"]).maybe_single().execute()
-        pet = pet_res.data if pet_res else None
+        pet = one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
         if pet:
             new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
             sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
