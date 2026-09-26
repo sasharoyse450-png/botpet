@@ -12,6 +12,7 @@ from aiogram.types import (
     WebAppInfo
 )
 from supabase import create_client, Client
+from aiohttp import web
 import aiohttp
 
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +24,7 @@ SUPABASE_KEY  = os.environ["SUPABASE_KEY"]
 WEBAPP_URL    = os.environ["WEBAPP_URL"]
 XROCKET_TOKEN = os.environ["XROCKET_TOKEN"]
 XROCKET_API   = os.environ.get("XROCKET_API", "https://pay.api.xrocket.exchange")
+PORT          = int(os.environ.get("PORT", 8080))
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -89,6 +91,11 @@ async def create_invoice(amount: float, currency: str, description: str) -> dict
     return data
 
 
+async def get_invoice_status(invoice_id: str) -> dict:
+    """Проверить статус инвойса в xRocket."""
+    return await xrocket_request("GET", f"/api/v1/invoices/{invoice_id}")
+
+
 async def create_cheque(user_id: int, amount: float, currency: str, description: str) -> dict:
     payload = {
         "asset": currency,
@@ -130,15 +137,16 @@ async def cmd_start(message: Message):
         await message.answer(f"🐾 Ты ухаживаешь за «{pet['name']}»!", reply_markup=kb)
         return
 
-    # ---------- topup_<petId>_<amount> ----------
+    # ---------- topup_<petId>_<cents> ----------
     if payload.startswith("topup_"):
         parts = payload[6:].split("_")
         pet_id = parts[0]
         try:
-            amount = float(parts[1]) if len(parts) > 1 else 1.0
+            cents = int(parts[1]) if len(parts) > 1 else 100
         except ValueError:
-            amount = 1.0
-        if amount <= 0 or amount > 100:
+            cents = 100
+        amount = cents / 100.0
+        if amount <= 0 or amount > 1000:
             await message.answer("Некорректная сумма.")
             return
 
@@ -164,26 +172,38 @@ async def cmd_start(message: Message):
             return
 
         link = pick_link(invoice)
-        if not link:
+        invoice_id = invoice.get("id") or invoice.get("invoiceId")
+        if not link or not invoice_id:
             await message.answer(
-                "⚠️ xRocket вернул инвойс без ссылки.\n\n"
+                "⚠️ xRocket вернул инвойс без ссылки или ID.\n\n"
                 "Ответ API:\n<code>" + str(invoice)[:800] + "</code>",
                 parse_mode="HTML"
             )
             return
 
+        # Сохраняем инвойс в БД, чтобы потом проверить
+        sb.table("invoices").insert({
+            "invoice_id": str(invoice_id),
+            "pet_id": pet_id,
+            "owner_id": user.id,
+            "amount": amount,
+            "currency": pet.get("currency", "USDT"),
+            "status": "pending",
+        }).execute()
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"💳 Оплатить {amount} {pet.get('currency','USDT')}", url=link)],
-            [InlineKeyboardButton(text="✅ Я оплатил", callback_data=f"topup_confirm_{pet_id}_{amount}")],
+            [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{invoice_id}")],
         ])
         await message.answer(
-            f"💳 Счёт на {amount} {pet.get('currency','USDT')} для банка питомца.\n"
-            f"Оплати и нажми «Я оплатил».",
+            f"💳 Счёт на {amount} {pet.get('currency','USDT')} для банка питомца.\n\n"
+            f"Оплати по кнопке выше. После оплаты нажми «Проверить оплату» — баланс "
+            f"начислится автоматически (или подожди, xRocket пришлёт уведомление сам).",
             reply_markup=kb
         )
         return
 
-    # ---------- salary_<petId>_<amount>_<topN> ----------
+    # ---------- salary_<petId>_<cents>_<topN> ----------
     if payload.startswith("salary_"):
         parts = payload[7:].split("_")
         if len(parts) < 3:
@@ -191,11 +211,12 @@ async def cmd_start(message: Message):
             return
         pet_id = parts[0]
         try:
-            amount = float(parts[1])
+            cents = int(parts[1])
             top_n = int(parts[2])
         except ValueError:
             await message.answer("Неверные параметры зарплаты.")
             return
+        amount = cents / 100.0
         await run_salary_pet(pet_id, user.id, amount, top_n, message)
         return
 
@@ -209,9 +230,111 @@ async def cmd_start(message: Message):
     )
 
 
+# ============ проверка оплаты по кнопке ============
+
+@dp.callback_query(F.data.startswith("check_"))
+async def cb_check_payment(call: CallbackQuery):
+    invoice_id = call.data[6:]
+    user = call.from_user
+
+    # Достаём инвойс из БД
+    inv_res = sb.table("invoices").select("*").eq("invoice_id", invoice_id).maybe_single().execute()
+    inv = inv_res.data if inv_res else None
+    if not inv:
+        await call.answer("Инвойс не найден", show_alert=True)
+        return
+    if inv["owner_id"] != user.id:
+        await call.answer("Это не твой счёт", show_alert=True)
+        return
+    if inv["status"] == "paid":
+        await call.answer("Уже оплачен ✅", show_alert=True)
+        return
+
+    # Проверяем в xRocket
+    try:
+        status_data = await get_invoice_status(invoice_id)
+    except Exception as e:
+        log.error("check invoice failed: %s", e)
+        await call.answer("Не удалось проверить, попробуй позже", show_alert=True)
+        return
+
+    log.info("invoice status: %s", status_data)
+    status = (status_data.get("status") or "").lower()
+
+    if status in ("paid", "success", "completed"):
+        # Начисляем баланс
+        pet_res = sb.table("pets").select("*").eq("id", inv["pet_id"]).maybe_single().execute()
+        pet = pet_res.data if pet_res else None
+        if pet:
+            new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
+            sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
+            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", invoice_id).execute()
+
+            await call.answer("Оплачено! ✅", show_alert=True)
+            try:
+                await call.message.edit_text(
+                    f"✅ Банк пополнен на {inv['amount']}.\nБаланс: {new_balance:.2f} USDT"
+                )
+            except Exception:
+                pass
+            return
+
+    await call.answer("Оплата не найдена. Подожди минуту и попробуй снова.", show_alert=True)
+
+
+# ============ вебхук от xRocket ============
+
+async def xrocket_webhook(request: web.Request) -> web.Response:
+    """xRocket присылает сюда уведомления об оплате инвойсов и чеков."""
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    log.info("xRocket webhook: %s", data)
+
+    # Пробуем достать ID инвойса и статус
+    invoice_id = data.get("invoiceId") or data.get("id") or (data.get("payload") or {}).get("invoiceId")
+    status = (data.get("status") or data.get("type") or "").lower()
+
+    if not invoice_id:
+        return web.json_response({"ok": True, "ignored": "no invoiceId"})
+
+    inv_res = sb.table("invoices").select("*").eq("invoice_id", str(invoice_id)).maybe_single().execute()
+    inv = inv_res.data if inv_res else None
+    if not inv or inv["status"] == "paid":
+        return web.json_response({"ok": True})
+
+    # Если статус явно про оплату — начисляем
+    if any(k in status for k in ("paid", "success", "completed", "invoice_paid")):
+        pet_res = sb.table("pets").select("*").eq("id", inv["pet_id"]).maybe_single().execute()
+        pet = pet_res.data if pet_res else None
+        if pet:
+            new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
+            sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
+            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", str(invoice_id)).execute()
+
+            # Уведомляем владельца
+            try:
+                await bot.send_message(
+                    inv["owner_id"],
+                    f"✅ Оплата получена. Банк питомца пополнен на {inv['amount']} USDT.\n"
+                    f"Текущий баланс: {new_balance:.2f} USDT"
+                )
+            except Exception as e:
+                log.warning("notify owner failed: %s", e)
+
+    return web.json_response({"ok": True})
+
+
+async def health(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "service": "pet-bot"})
+
+
+# ============ salary ============
+
 @dp.message(Command("salary"))
 async def cmd_salary(message: Message):
-    """Команда /salary — по умолчанию раздать весь банк между всеми активными."""
     pet_res = sb.table("pets").select("*").eq("owner_id", message.from_user.id).maybe_single().execute()
     pet = pet_res.data if pet_res else None
     if not pet:
@@ -221,7 +344,6 @@ async def cmd_salary(message: Message):
 
 
 async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n: int | None, message: Message):
-    """Основная логика выплаты. amount — сколько раздать. top_n — скольким лучшим."""
     pet_res = sb.table("pets").select("*").eq("id", pet_id).maybe_single().execute()
     pet = pet_res.data if pet_res else None
     if not pet:
@@ -236,19 +358,16 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         await message.answer("Банк пуст.")
         return
 
-    # Определяем сумму к раздаче
     if amount is None or amount <= 0:
         amount = balance
     if amount > balance:
         await message.answer(f"В банке только {balance:.2f}. Уменьши сумму.")
         return
 
-    # Получаем участников
     today = date.today().isoformat()
     members_res = sb.table("members").select("*").eq("pet_id", pet["id"]).execute()
     members = members_res.data or []
 
-    # Сбрасываем дневной счёт у тех, кто не заходил сегодня
     for m in members:
         if m.get("today_date") != today:
             sb.table("members").update({
@@ -256,13 +375,11 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
             }).eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
             m["today_score"] = 0
 
-    # Оставляем только активных
     active = [m for m in members if (m.get("today_score") or 0) > 0]
     if not active:
         await message.answer("Сегодня никто не был активен — распределять нечего.")
         return
 
-    # Сортируем по очкам и берём топ-N
     active.sort(key=lambda m: m["today_score"], reverse=True)
     if top_n and top_n > 0 and top_n < len(active):
         winners = active[:top_n]
@@ -274,7 +391,6 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         await message.answer("Нет очков для распределения.")
         return
 
-    # Запись о выплате
     payout_res = sb.table("payouts").insert({
         "pet_id": pet["id"],
         "owner_id": owner_id,
@@ -340,11 +456,9 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
             log.error("cheque for %s failed: %s", m["user_id"], e)
             failed += 1
 
-    # Списываем только разданное
     new_balance = round(balance - amount, 6)
     sb.table("pets").update({"bank_balance": new_balance}).eq("id", pet["id"]).execute()
 
-    # Обнуляем дневной счёт только у победителей
     for m in winners:
         sb.table("members").update({
             "today_score": 0, "today_date": today
@@ -358,36 +472,6 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         f"Ошибок: {failed}\n"
         f"Остаток в банке: {new_balance:.2f} USDT"
     )
-
-
-# ============ topup_confirm_<petId>_<amount> ============
-
-@dp.callback_query(F.data.startswith("topup_confirm_"))
-async def cb_topup_confirm(call: CallbackQuery):
-    parts = call.data[14:].split("_")
-    pet_id = parts[0]
-    try:
-        amount = float(parts[1]) if len(parts) > 1 else 1.0
-    except ValueError:
-        amount = 1.0
-
-    user = call.from_user
-    pet_res = sb.table("pets").select("*").eq("id", pet_id).maybe_single().execute()
-    pet = pet_res.data if pet_res else None
-    if not pet or pet["owner_id"] != user.id:
-        await call.answer("Нет доступа", show_alert=True)
-        return
-
-    new_balance = float(pet.get("bank_balance") or 0) + amount
-    sb.table("pets").update({"bank_balance": new_balance}).eq("id", pet_id).execute()
-
-    await call.answer(f"Банк +{amount}")
-    try:
-        await call.message.edit_text(
-            f"✅ Банк пополнен на {amount:.2f}.\nБаланс: {new_balance:.2f} USDT"
-        )
-    except Exception:
-        pass
 
 
 # ============ create ============
@@ -454,17 +538,33 @@ async def cmd_help(message: Message):
         "🐾 <b>Как играть</b>\n\n"
         "1. Создай питомца\n2. Кинь ссылку друзьям\n3. Вместе кормите — он растёт\n\n"
         "<b>Для владельца:</b>\n"
-        "• Пополнить банк — в приложении (любая сумма)\n"
+        "• Пополнить банк — в приложении\n"
         "• Зарплата — в приложении, с выбором суммы и топ-N",
         parse_mode="HTML"
     )
+
+
+# ============ запуск ============
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    app.router.add_post("/webhook/xrocket", xrocket_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("Web server listening on port %s", PORT)
 
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
     log.info("Bot @%s started", me.username)
-    await dp.start_polling(me and bot)
+
+    await start_web_server()
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
