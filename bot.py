@@ -74,7 +74,10 @@ async def xrocket_request(method: str, path: str, json: dict | None = None) -> d
                 data = {"raw": raw}
             if resp.status >= 400:
                 log.error("xRocket error %s: %s", resp.status, data)
-                raise RuntimeError(f"xRocket {resp.status}: {data}")
+                err = RuntimeError(f"xRocket {resp.status}: {data}")
+                err.status = resp.status
+                err.data = data
+                raise err
             return data
 
 
@@ -92,7 +95,6 @@ async def create_invoice(amount: float, currency: str, description: str) -> dict
 
 
 async def get_invoice_status(invoice_id: str) -> dict:
-    """Проверить статус инвойса в xRocket."""
     return await xrocket_request("GET", f"/api/v1/invoices/{invoice_id}")
 
 
@@ -109,6 +111,23 @@ async def create_cheque(user_id: int, amount: float, currency: str, description:
     return data
 
 
+def xrocket_error_text(e: Exception) -> str:
+    """Человеческое объяснение ошибки xRocket."""
+    data = getattr(e, "data", None) or {}
+    kind = data.get("kind") or ""
+    detail = data.get("detail") or str(e)
+    if "operation_disabled" in kind or "disabled" in detail.lower():
+        return (
+            "⚠️ xRocket отключил эту операцию для твоего приложения.\n\n"
+            "Зайди в @xRocket → xRocket API → твоё приложение (302777) → "
+            "проверь раздел «Permissions» / «Operations» / «Payouts» и включи вывод (cheques). "
+            "Если тумблера нет — напиши в @xRocketSupport и попроси включить операцию."
+        )
+    if "forbidden" in kind:
+        return f"⚠️ xRocket запретил операцию: {detail}"
+    return f"⚠️ Ошибка xRocket: {detail}"
+
+
 # ============ /start ============
 
 @dp.message(CommandStart())
@@ -117,6 +136,7 @@ async def cmd_start(message: Message):
     if message.text and " " in message.text:
         payload = message.text.split(" ", 1)[1].strip()
     user = message.from_user
+    log.info("cmd_start payload=%r user=%s", payload, user.id)
 
     # ---------- join_ ----------
     if payload.startswith("join_"):
@@ -168,7 +188,7 @@ async def cmd_start(message: Message):
             )
         except Exception as e:
             log.error("invoice failed: %s", e)
-            await message.answer(f"Не удалось создать счёт.\n{e}")
+            await message.answer(xrocket_error_text(e))
             return
 
         link = pick_link(invoice)
@@ -181,7 +201,6 @@ async def cmd_start(message: Message):
             )
             return
 
-        # Сохраняем инвойс в БД, чтобы потом проверить
         sb.table("invoices").insert({
             "invoice_id": str(invoice_id),
             "pet_id": pet_id,
@@ -197,8 +216,8 @@ async def cmd_start(message: Message):
         ])
         await message.answer(
             f"💳 Счёт на {amount} {pet.get('currency','USDT')} для банка питомца.\n\n"
-            f"Оплати по кнопке выше. После оплаты нажми «Проверить оплату» — баланс "
-            f"начислится автоматически (или подожди, xRocket пришлёт уведомление сам).",
+            f"Оплати по кнопке выше. После оплаты нажми «Проверить оплату» — "
+            f"баланс начислится автоматически.",
             reply_markup=kb
         )
         return
@@ -222,7 +241,13 @@ async def cmd_start(message: Message):
 
     # ---------- обычный /start ----------
     await message.answer(
-        "👋 Это бот общего питомца.\n\nСоздай питомца — получишь ссылку для друзей.",
+        "👋 Это бот общего питомца.\n\nСоздай питомца — получишь ссылку для друзей.\n\n"
+        "<b>Команды для владельца:</b>\n"
+        "/balance — баланс банка\n"
+        "/topup 1 — пополнить банк на 1 USDT\n"
+        "/salary 1 3 — раздать 1 USDT топ-3\n"
+        "/salary — раздать весь банк всем активным",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🐣 Создать питомца", callback_data="create")],
             [InlineKeyboardButton(text="📋 Мои питомцы", callback_data="my_pets")],
@@ -230,14 +255,13 @@ async def cmd_start(message: Message):
     )
 
 
-# ============ проверка оплаты по кнопке ============
+# ============ проверка оплаты ============
 
 @dp.callback_query(F.data.startswith("check_"))
 async def cb_check_payment(call: CallbackQuery):
     invoice_id = call.data[6:]
     user = call.from_user
 
-    # Достаём инвойс из БД
     inv_res = sb.table("invoices").select("*").eq("invoice_id", invoice_id).maybe_single().execute()
     inv = inv_res.data if inv_res else None
     if not inv:
@@ -250,7 +274,6 @@ async def cb_check_payment(call: CallbackQuery):
         await call.answer("Уже оплачен ✅", show_alert=True)
         return
 
-    # Проверяем в xRocket
     try:
         status_data = await get_invoice_status(invoice_id)
     except Exception as e:
@@ -262,7 +285,6 @@ async def cb_check_payment(call: CallbackQuery):
     status = (status_data.get("status") or "").lower()
 
     if status in ("paid", "success", "completed"):
-        # Начисляем баланс
         pet_res = sb.table("pets").select("*").eq("id", inv["pet_id"]).maybe_single().execute()
         pet = pet_res.data if pet_res else None
         if pet:
@@ -282,65 +304,111 @@ async def cb_check_payment(call: CallbackQuery):
     await call.answer("Оплата не найдена. Подожди минуту и попробуй снова.", show_alert=True)
 
 
-# ============ вебхук от xRocket ============
+# ============ команды ============
 
-async def xrocket_webhook(request: web.Request) -> web.Response:
-    """xRocket присылает сюда уведомления об оплате инвойсов и чеков."""
-    try:
-        data = await request.json()
-    except Exception:
-        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
-
-    log.info("xRocket webhook: %s", data)
-
-    # Пробуем достать ID инвойса и статус
-    invoice_id = data.get("invoiceId") or data.get("id") or (data.get("payload") or {}).get("invoiceId")
-    status = (data.get("status") or data.get("type") or "").lower()
-
-    if not invoice_id:
-        return web.json_response({"ok": True, "ignored": "no invoiceId"})
-
-    inv_res = sb.table("invoices").select("*").eq("invoice_id", str(invoice_id)).maybe_single().execute()
-    inv = inv_res.data if inv_res else None
-    if not inv or inv["status"] == "paid":
-        return web.json_response({"ok": True})
-
-    # Если статус явно про оплату — начисляем
-    if any(k in status for k in ("paid", "success", "completed", "invoice_paid")):
-        pet_res = sb.table("pets").select("*").eq("id", inv["pet_id"]).maybe_single().execute()
-        pet = pet_res.data if pet_res else None
-        if pet:
-            new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
-            sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
-            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", str(invoice_id)).execute()
-
-            # Уведомляем владельца
-            try:
-                await bot.send_message(
-                    inv["owner_id"],
-                    f"✅ Оплата получена. Банк питомца пополнен на {inv['amount']} USDT.\n"
-                    f"Текущий баланс: {new_balance:.2f} USDT"
-                )
-            except Exception as e:
-                log.warning("notify owner failed: %s", e)
-
-    return web.json_response({"ok": True})
-
-
-async def health(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True, "service": "pet-bot"})
-
-
-# ============ salary ============
-
-@dp.message(Command("salary"))
-async def cmd_salary(message: Message):
+@dp.message(Command("balance"))
+async def cmd_balance(message: Message):
     pet_res = sb.table("pets").select("*").eq("owner_id", message.from_user.id).maybe_single().execute()
     pet = pet_res.data if pet_res else None
     if not pet:
         await message.answer("У тебя нет питомца, где ты владелец.")
         return
-    await run_salary_pet(pet["id"], message.from_user.id, None, None, message)
+    await message.answer(
+        f"🏦 Банк питомца «{pet['name']}»: <b>{float(pet.get('bank_balance') or 0):.2f} "
+        f"{pet.get('currency','USDT')}</b>",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("topup"))
+async def cmd_topup(message: Message):
+    user = message.from_user
+    pet_res = sb.table("pets").select("*").eq("owner_id", user.id).maybe_single().execute()
+    pet = pet_res.data if pet_res else None
+    if not pet:
+        await message.answer("У тебя нет питомца, где ты владелец.")
+        return
+
+    # Парсим сумму: /topup 1 или /topup 0.04
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: /topup 1  (или /topup 0.5)")
+        return
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except ValueError:
+        await message.answer("Не могу разобрать сумму. Пример: /topup 1")
+        return
+    if amount <= 0 or amount > 1000:
+        await message.answer("Сумма должна быть от 0.01 до 1000 USDT")
+        return
+
+    await message.answer(f"💳 Создаю счёт на {amount} {pet.get('currency','USDT')}…")
+    try:
+        invoice = await create_invoice(
+            amount=amount,
+            currency=pet.get("currency", "USDT"),
+            description=f"Пополнение банка питомца «{pet['name']}»"
+        )
+    except Exception as e:
+        log.error("invoice failed: %s", e)
+        await message.answer(xrocket_error_text(e))
+        return
+
+    link = pick_link(invoice)
+    invoice_id = invoice.get("id") or invoice.get("invoiceId")
+    if not link or not invoice_id:
+        await message.answer("⚠️ xRocket вернул инвойс без ссылки:\n<code>" + str(invoice)[:800] + "</code>", parse_mode="HTML")
+        return
+
+    sb.table("invoices").insert({
+        "invoice_id": str(invoice_id),
+        "pet_id": pet["id"],
+        "owner_id": user.id,
+        "amount": amount,
+        "currency": pet.get("currency", "USDT"),
+        "status": "pending",
+    }).execute()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💳 Оплатить {amount} USDT", url=link)],
+        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{invoice_id}")],
+    ])
+    await message.answer(
+        f"💳 Счёт на {amount} USDT. После оплаты нажми «Проверить оплату».",
+        reply_markup=kb
+    )
+
+
+@dp.message(Command("salary"))
+async def cmd_salary(message: Message):
+    user = message.from_user
+    pet_res = sb.table("pets").select("*").eq("owner_id", user.id).maybe_single().execute()
+    pet = pet_res.data if pet_res else None
+    if not pet:
+        await message.answer("У тебя нет питомца, где ты владелец.")
+        return
+
+    # /salary             → весь банк всем
+    # /salary 1           → 1 USDT всем
+    # /salary 1 3         → 1 USDT топ-3
+    parts = message.text.split()
+    amount = None
+    top_n = None
+    if len(parts) >= 2:
+        try:
+            amount = float(parts[1].replace(",", "."))
+        except ValueError:
+            await message.answer("Не могу разобрать сумму. Пример: /salary 1 3")
+            return
+    if len(parts) >= 3:
+        try:
+            top_n = int(parts[2])
+        except ValueError:
+            await message.answer("Не могу разобрать топ-N. Пример: /salary 1 3")
+            return
+
+    await run_salary_pet(pet["id"], user.id, amount, top_n, message)
 
 
 async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n: int | None, message: Message):
@@ -391,6 +459,31 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         await message.answer("Нет очков для распределения.")
         return
 
+    # СНАЧАЛА пробуем создать первый чек — если xRocket выключен,
+    # узнаем об этом до списания и не потеряем деньги.
+    test_winner = winners[0]
+    test_share = round(amount * (test_winner["today_score"] / total_score), 6)
+    if test_share < 0.01:
+        await message.answer("Доли слишком малы для чеков (минимум 0.01 USDT). Увеличь сумму.")
+        return
+
+    try:
+        await create_cheque(
+            user_id=test_winner["user_id"],
+            amount=test_share,
+            currency=pet.get("currency", "USDT"),
+            description="Проверка xRocket"
+        )
+    except Exception as e:
+        log.error("salary aborted, xRocket cheque failed: %s", e)
+        await message.answer(
+            "❌ Не могу создать чеки — xRocket не разрешает эту операцию.\n\n" +
+            xrocket_error_text(e) +
+            "\n\nБанк НЕ тронут, деньги на месте. "
+            "Пока чеки в xRocket не включишь — зарплата работать не будет."
+        )
+        return
+
     payout_res = sb.table("payouts").insert({
         "pet_id": pet["id"],
         "owner_id": owner_id,
@@ -433,23 +526,22 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
                 "status": "sent" if link else "no_link",
             }).execute()
 
-            if not link:
-                log.warning("cheque without link: %s", cheque)
-                continue
-
-            try:
-                await bot.send_message(
-                    m["user_id"],
-                    f"💰 <b>Зарплата за заботу о питомце «{pet['name']}»!</b>\n\n"
-                    f"Твоя активность: {score} очков\n"
-                    f"Начислено: <b>{share:.4f} {pet.get('currency','USDT')}</b>\n\n"
-                    f"Забрать: {link}",
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                sent += 1
-            except Exception as e:
-                log.warning("send cheque to %s failed: %s", m["user_id"], e)
+            if link:
+                try:
+                    await bot.send_message(
+                        m["user_id"],
+                        f"💰 <b>Зарплата за заботу о питомце «{pet['name']}»!</b>\n\n"
+                        f"Твоя активность: {score} очков\n"
+                        f"Начислено: <b>{share:.4f} {pet.get('currency','USDT')}</b>\n\n"
+                        f"Забрать: {link}",
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    sent += 1
+                except Exception as e:
+                    log.warning("send cheque to %s failed: %s", m["user_id"], e)
+                    failed += 1
+            else:
                 failed += 1
 
         except Exception as e:
@@ -538,10 +630,59 @@ async def cmd_help(message: Message):
         "🐾 <b>Как играть</b>\n\n"
         "1. Создай питомца\n2. Кинь ссылку друзьям\n3. Вместе кормите — он растёт\n\n"
         "<b>Для владельца:</b>\n"
-        "• Пополнить банк — в приложении\n"
-        "• Зарплата — в приложении, с выбором суммы и топ-N",
+        "/balance — баланс банка\n"
+        "/topup 1 — пополнить банк на 1 USDT\n"
+        "/salary — раздать весь банк\n"
+        "/salary 1 — раздать 1 USDT всем\n"
+        "/salary 1 3 — раздать 1 USDT топ-3\n\n"
+        "Также всё это есть в приложении кнопками.",
         parse_mode="HTML"
     )
+
+
+# ============ вебхук + health ============
+
+async def xrocket_webhook(request: web.Request) -> web.Response:
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+    log.info("xRocket webhook: %s", data)
+
+    invoice_id = data.get("invoiceId") or data.get("id") or (data.get("payload") or {}).get("invoiceId")
+    status = (data.get("status") or data.get("type") or "").lower()
+
+    if not invoice_id:
+        return web.json_response({"ok": True, "ignored": "no invoiceId"})
+
+    inv_res = sb.table("invoices").select("*").eq("invoice_id", str(invoice_id)).maybe_single().execute()
+    inv = inv_res.data if inv_res else None
+    if not inv or inv["status"] == "paid":
+        return web.json_response({"ok": True})
+
+    if any(k in status for k in ("paid", "success", "completed", "invoice_paid")):
+        pet_res = sb.table("pets").select("*").eq("id", inv["pet_id"]).maybe_single().execute()
+        pet = pet_res.data if pet_res else None
+        if pet:
+            new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
+            sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
+            sb.table("invoices").update({"status": "paid"}).eq("invoice_id", str(invoice_id)).execute()
+
+            try:
+                await bot.send_message(
+                    inv["owner_id"],
+                    f"✅ Оплата получена. Банк пополнен на {inv['amount']} USDT.\n"
+                    f"Текущий баланс: {new_balance:.2f} USDT"
+                )
+            except Exception as e:
+                log.warning("notify owner failed: %s", e)
+
+    return web.json_response({"ok": True})
+
+
+async def health(request: web.Request) -> web.Response:
+    return web.json_response({"ok": True, "service": "pet-bot"})
 
 
 # ============ запуск ============
