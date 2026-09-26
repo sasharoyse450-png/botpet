@@ -26,11 +26,17 @@ XROCKET_TOKEN = os.environ["XROCKET_TOKEN"]
 XROCKET_API   = os.environ.get("XROCKET_API", "https://pay.api.xrocket.exchange")
 PORT          = int(os.environ.get("PORT", 8080))
 
+ADMIN_IDS = {8130244626}
+
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
 sb: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
 
 def gen_code(length: int = 6) -> str:
@@ -112,16 +118,15 @@ async def create_cheque(user_id: int, amount: float, currency: str, description:
 
 
 def xrocket_error_text(e: Exception) -> str:
-    """Человеческое объяснение ошибки xRocket."""
     data = getattr(e, "data", None) or {}
     kind = data.get("kind") or ""
     detail = data.get("detail") or str(e)
     if "operation_disabled" in kind or "disabled" in detail.lower():
         return (
             "⚠️ xRocket отключил эту операцию для твоего приложения.\n\n"
-            "Зайди в @xRocket → xRocket API → твоё приложение (302777) → "
-            "проверь раздел «Permissions» / «Operations» / «Payouts» и включи вывод (cheques). "
-            "Если тумблера нет — напиши в @xRocketSupport и попроси включить операцию."
+            "Зайди в @xRocket → xRocket API → приложение 302777 → "
+            "проверь Permissions / Operations и включи вывод. "
+            "Если тумблера нет — напиши в @xRocketSupport."
         )
     if "forbidden" in kind:
         return f"⚠️ xRocket запретил операцию: {detail}"
@@ -138,7 +143,6 @@ async def cmd_start(message: Message):
     user = message.from_user
     log.info("cmd_start payload=%r user=%s", payload, user.id)
 
-    # ---------- join_ ----------
     if payload.startswith("join_"):
         code = payload[5:]
         res = sb.table("pets").select("*").eq("invite_code", code).maybe_single().execute()
@@ -157,7 +161,6 @@ async def cmd_start(message: Message):
         await message.answer(f"🐾 Ты ухаживаешь за «{pet['name']}»!", reply_markup=kb)
         return
 
-    # ---------- topup_<petId>_<cents> ----------
     if payload.startswith("topup_"):
         parts = payload[6:].split("_")
         pet_id = parts[0]
@@ -222,7 +225,6 @@ async def cmd_start(message: Message):
         )
         return
 
-    # ---------- salary_<petId>_<cents>_<topN> ----------
     if payload.startswith("salary_"):
         parts = payload[7:].split("_")
         if len(parts) < 3:
@@ -239,14 +241,31 @@ async def cmd_start(message: Message):
         await run_salary_pet(pet_id, user.id, amount, top_n, message)
         return
 
-    # ---------- обычный /start ----------
-    await message.answer(
-        "👋 Это бот общего питомца.\n\nСоздай питомца — получишь ссылку для друзей.\n\n"
-        "<b>Команды для владельца:</b>\n"
-        "/balance — баланс банка\n"
-        "/topup 1 — пополнить банк на 1 USDT\n"
-        "/salary 1 3 — раздать 1 USDT топ-3\n"
+    help_lines = [
+        "👋 Это бот общего питомца.",
+        "",
+        "Создай питомца — получишь ссылку для друзей.",
+        "",
+        "<b>Для владельца:</b>",
+        "/balance — баланс банка",
+        "/topup 1 — пополнить банк на 1 USDT",
+        "/salary 1 3 — раздать 1 USDT топ-3",
         "/salary — раздать весь банк всем активным",
+    ]
+    if is_admin(user.id):
+        help_lines += [
+            "",
+            "<b>🛠 Админ:</b>",
+            "/admin — справка по админке",
+            "/setbal 5 — установить баланс (себе)",
+            "/addbal 1 — прибавить к балансу (себе)",
+            "/setbal_pet &lt;pet_id&gt; 5 — установить баланс питомцу",
+            "/list_pets — список всех питомцев",
+            "/reset_scores — обнулить дневные очки",
+        ]
+
+    await message.answer(
+        "\n".join(help_lines),
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🐣 Создать питомца", callback_data="create")],
@@ -277,21 +296,29 @@ async def cb_check_payment(call: CallbackQuery):
     try:
         status_data = await get_invoice_status(invoice_id)
     except Exception as e:
+        data = getattr(e, "data", None) or {}
+        status_code = getattr(e, "status", "?")
+        detail = data.get("detail") or data.get("title") or str(e)
         log.error("check invoice failed: %s", e)
-        await call.answer("Не удалось проверить, попробуй позже", show_alert=True)
+        await call.answer(f"xRocket {status_code}: {detail[:180]}", show_alert=True)
         return
 
     log.info("invoice status: %s", status_data)
-    status = (status_data.get("status") or "").lower()
 
-    if status in ("paid", "success", "completed"):
+    status = (
+        status_data.get("status")
+        or status_data.get("state")
+        or (status_data.get("invoice") or {}).get("status")
+        or ""
+    ).lower()
+
+    if status in ("paid", "success", "completed", "paid_success"):
         pet_res = sb.table("pets").select("*").eq("id", inv["pet_id"]).maybe_single().execute()
         pet = pet_res.data if pet_res else None
         if pet:
             new_balance = float(pet.get("bank_balance") or 0) + float(inv["amount"])
             sb.table("pets").update({"bank_balance": new_balance}).eq("id", inv["pet_id"]).execute()
             sb.table("invoices").update({"status": "paid"}).eq("invoice_id", invoice_id).execute()
-
             await call.answer("Оплачено! ✅", show_alert=True)
             try:
                 await call.message.edit_text(
@@ -301,10 +328,13 @@ async def cb_check_payment(call: CallbackQuery):
                 pass
             return
 
-    await call.answer("Оплата не найдена. Подожди минуту и попробуй снова.", show_alert=True)
+    await call.answer(
+        f"Статус: {status or 'неизвестно'}\n{str(status_data)[:200]}",
+        show_alert=True
+    )
 
 
-# ============ команды ============
+# ============ команды владельца ============
 
 @dp.message(Command("balance"))
 async def cmd_balance(message: Message):
@@ -329,7 +359,6 @@ async def cmd_topup(message: Message):
         await message.answer("У тебя нет питомца, где ты владелец.")
         return
 
-    # Парсим сумму: /topup 1 или /topup 0.04
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         await message.answer("Использование: /topup 1  (или /topup 0.5)")
@@ -389,9 +418,6 @@ async def cmd_salary(message: Message):
         await message.answer("У тебя нет питомца, где ты владелец.")
         return
 
-    # /salary             → весь банк всем
-    # /salary 1           → 1 USDT всем
-    # /salary 1 3         → 1 USDT топ-3
     parts = message.text.split()
     amount = None
     top_n = None
@@ -459,8 +485,7 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         await message.answer("Нет очков для распределения.")
         return
 
-    # СНАЧАЛА пробуем создать первый чек — если xRocket выключен,
-    # узнаем об этом до списания и не потеряем деньги.
+    # Пробный чек первому — если xRocket отключил, ничего не спишем
     test_winner = winners[0]
     test_share = round(amount * (test_winner["today_score"] / total_score), 6)
     if test_share < 0.01:
@@ -479,8 +504,7 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         await message.answer(
             "❌ Не могу создать чеки — xRocket не разрешает эту операцию.\n\n" +
             xrocket_error_text(e) +
-            "\n\nБанк НЕ тронут, деньги на месте. "
-            "Пока чеки в xRocket не включишь — зарплата работать не будет."
+            "\n\nБанк НЕ тронут, деньги на месте."
         )
         return
 
@@ -505,7 +529,6 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
         share = round(amount * (score / total_score), 6)
         if share < 0.01:
             continue
-
         try:
             cheque = await create_cheque(
                 user_id=m["user_id"],
@@ -515,7 +538,6 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
             )
             cheque_id = cheque.get("chequeId") or cheque.get("id")
             link = pick_link(cheque)
-
             sb.table("cheques").insert({
                 "payout_id": payout["id"],
                 "pet_id": pet["id"],
@@ -525,7 +547,6 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
                 "cheque_link": link,
                 "status": "sent" if link else "no_link",
             }).execute()
-
             if link:
                 try:
                     await bot.send_message(
@@ -543,7 +564,6 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
                     failed += 1
             else:
                 failed += 1
-
         except Exception as e:
             log.error("cheque for %s failed: %s", m["user_id"], e)
             failed += 1
@@ -566,7 +586,145 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
     )
 
 
-# ============ create ============
+# ============ АДМИНКА ============
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "🛠 <b>Админ-команды</b>\n\n"
+        "/setbal 5 — установить баланс банка (своему питомцу)\n"
+        "/addbal 1 — прибавить к балансу\n"
+        "/setbal_pet &lt;pet_id&gt; 5 — установить баланс конкретному питомцу\n"
+        "/addbal_pet &lt;pet_id&gt; 1 — прибавить конкретному питомцу\n"
+        "/list_pets — все питомцы с балансами\n"
+        "/reset_scores — обнулить today_score у всех",
+        parse_mode="HTML"
+    )
+
+
+@dp.message(Command("setbal"))
+async def cmd_setbal(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /setbal 5")
+        return
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except ValueError:
+        await message.answer("Не могу разобрать сумму.")
+        return
+    pet_res = sb.table("pets").select("*").eq("owner_id", message.from_user.id).maybe_single().execute()
+    pet = pet_res.data if pet_res else None
+    if not pet:
+        await message.answer("У тебя нет питомца.")
+        return
+    sb.table("pets").update({"bank_balance": amount}).eq("id", pet["id"]).execute()
+    await message.answer(f"✅ Баланс питомца «{pet['name']}»: {amount:.2f} USDT")
+
+
+@dp.message(Command("addbal"))
+async def cmd_addbal(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /addbal 1")
+        return
+    try:
+        amount = float(parts[1].replace(",", "."))
+    except ValueError:
+        await message.answer("Не могу разобрать сумму.")
+        return
+    pet_res = sb.table("pets").select("*").eq("owner_id", message.from_user.id).maybe_single().execute()
+    pet = pet_res.data if pet_res else None
+    if not pet:
+        await message.answer("У тебя нет питомца.")
+        return
+    new_balance = float(pet.get("bank_balance") or 0) + amount
+    sb.table("pets").update({"bank_balance": new_balance}).eq("id", pet["id"]).execute()
+    await message.answer(f"✅ Баланс питомца «{pet['name']}»: {new_balance:.2f} USDT")
+
+
+@dp.message(Command("setbal_pet"))
+async def cmd_setbal_pet(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("Использование: /setbal_pet <pet_id> 5")
+        return
+    pet_id = parts[1]
+    try:
+        amount = float(parts[2].replace(",", "."))
+    except ValueError:
+        await message.answer("Не могу разобрать сумму.")
+        return
+    res = sb.table("pets").select("*").eq("id", pet_id).maybe_single().execute()
+    pet = res.data if res else None
+    if not pet:
+        await message.answer("Питомец с таким ID не найден.")
+        return
+    sb.table("pets").update({"bank_balance": amount}).eq("id", pet_id).execute()
+    await message.answer(f"✅ «{pet['name']}»: {amount:.2f} USDT")
+
+
+@dp.message(Command("addbal_pet"))
+async def cmd_addbal_pet(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("Использование: /addbal_pet <pet_id> 1")
+        return
+    pet_id = parts[1]
+    try:
+        amount = float(parts[2].replace(",", "."))
+    except ValueError:
+        await message.answer("Не могу разобрать сумму.")
+        return
+    res = sb.table("pets").select("*").eq("id", pet_id).maybe_single().execute()
+    pet = res.data if res else None
+    if not pet:
+        await message.answer("Питомец с таким ID не найден.")
+        return
+    new_balance = float(pet.get("bank_balance") or 0) + amount
+    sb.table("pets").update({"bank_balance": new_balance}).eq("id", pet_id).execute()
+    await message.answer(f"✅ «{pet['name']}»: {new_balance:.2f} USDT")
+
+
+@dp.message(Command("list_pets"))
+async def cmd_list_pets(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    res = sb.table("pets").select("id,name,owner_id,bank_balance,xp").execute()
+    pets = res.data or []
+    if not pets:
+        await message.answer("Питомцев нет.")
+        return
+    lines = ["🐾 <b>Все питомцы:</b>\n"]
+    for p in pets[:30]:
+        lines.append(
+            f"• <code>{p['id']}</code>\n"
+            f"  {p['name']} — {float(p.get('bank_balance') or 0):.2f} USDT "
+            f"(xp {p.get('xp') or 0})"
+        )
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("reset_scores"))
+async def cmd_reset_scores(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    today = date.today().isoformat()
+    sb.table("members").update({"today_score": 0, "today_date": today}).neq("user_id", 0).execute()
+    await message.answer("✅ Дневные очки обнулены у всех.")
+
+
+# ============ create / my_pets / help ============
 
 @dp.callback_query(F.data == "create")
 async def cb_create(call: CallbackQuery):
@@ -631,11 +789,10 @@ async def cmd_help(message: Message):
         "1. Создай питомца\n2. Кинь ссылку друзьям\n3. Вместе кормите — он растёт\n\n"
         "<b>Для владельца:</b>\n"
         "/balance — баланс банка\n"
-        "/topup 1 — пополнить банк на 1 USDT\n"
+        "/topup 1 — пополнить на 1 USDT\n"
         "/salary — раздать весь банк\n"
         "/salary 1 — раздать 1 USDT всем\n"
-        "/salary 1 3 — раздать 1 USDT топ-3\n\n"
-        "Также всё это есть в приложении кнопками.",
+        "/salary 1 3 — раздать 1 USDT топ-3",
         parse_mode="HTML"
     )
 
@@ -702,7 +859,7 @@ async def start_web_server():
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
-    log.info("Bot @%s started", me.username)
+    log.info("Bot @%s started (admin ids: %s)", me.username, ADMIN_IDS)
 
     await start_web_server()
     await dp.start_polling(bot)
