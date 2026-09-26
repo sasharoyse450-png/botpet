@@ -27,8 +27,6 @@ XROCKET_API   = os.environ.get("XROCKET_API", "https://pay.api.xrocket.exchange"
 PORT          = int(os.environ.get("PORT", 8080))
 
 ADMIN_IDS = {8130244626}
-
-# Минимум на один чек (у xRocket ограничение)
 MIN_CHEQUE = 0.01
 
 bot = Bot(token=BOT_TOKEN)
@@ -67,7 +65,6 @@ def pick_link(obj: dict) -> str | None:
 
 
 def one(query):
-    """Безопасная замена .maybe_single()."""
     try:
         res = query.limit(1).execute()
         data = getattr(res, "data", None) or []
@@ -80,7 +77,6 @@ def one(query):
 
 
 def many(query):
-    """Безопасный список."""
     try:
         res = query.execute()
         return getattr(res, "data", None) or []
@@ -89,7 +85,7 @@ def many(query):
         return []
 
 
-# ============ xRocket helpers ============
+# ============ xRocket ============
 
 async def xrocket_request(method: str, path: str, json: dict | None = None) -> dict:
     url = f"{XROCKET_API}{path}"
@@ -105,10 +101,12 @@ async def xrocket_request(method: str, path: str, json: dict | None = None) -> d
             except Exception:
                 data = {"raw": raw}
             if resp.status >= 400:
-                log.error("xRocket error %s: %s", resp.status, data)
+                log.error("xRocket error %s [%s %s]: %s", resp.status, method, path, data)
                 err = RuntimeError(f"xRocket {resp.status}: {data}")
                 err.status = resp.status
                 err.data = data
+                err.path = path
+                err.method = method
                 raise err
             return data
 
@@ -144,21 +142,64 @@ async def create_cheque(user_id: int, amount: float, currency: str, description:
 
 
 async def delete_cheque(cheque_id: str) -> dict:
-    """Отменить неактивированный чек. Вернёт зарезервированные деньги на баланс приложения."""
-    # У xRocket пробуем два варианта — если один 404, используем другой.
+    """Отменить неактивированный чек. Пробуем несколько вариантов пути."""
+    # Вариант 1: DELETE /api/v1/cheques/{id}
     try:
         return await xrocket_request("DELETE", f"/api/v1/cheques/{cheque_id}")
-    except Exception as e:
-        status = getattr(e, "status", None)
-        if status == 404 or status == 405:
-            # альтернативный путь
+    except Exception as e1:
+        status1 = getattr(e1, "status", None)
+        log.warning("delete path 1 failed (%s), trying path 2", status1)
+        # Вариант 2: DELETE /api/v1/cheques?chequeId=...
+        try:
             return await xrocket_request("DELETE", f"/api/v1/cheques?chequeId={cheque_id}")
-        raise
+        except Exception as e2:
+            status2 = getattr(e2, "status", None)
+            log.warning("delete path 2 failed (%s), trying path 3", status2)
+            # Вариант 3: POST /api/v1/cheques/{id}/cancel
+            return await xrocket_request("POST", f"/api/v1/cheques/{cheque_id}/cancel")
 
 
-async def get_cheque_info(cheque_id: str) -> dict:
-    """Получить статус чека из xRocket."""
-    return await xrocket_request("GET", f"/api/v1/cheques/{cheque_id}")
+async def list_xrocket_cheques() -> list[dict]:
+    """Пытается получить список активных чеков из xRocket."""
+    paths = [
+        "/api/v1/cheques?status=active",
+        "/api/v1/cheques",
+        "/api/v1/cheques/my",
+    ]
+    for p in paths:
+        try:
+            data = await xrocket_request("GET", p)
+            log.info("list_xrocket_cheques %s -> %s", p, str(data)[:300])
+            # xRocket может вернуть {"cheques": [...]} или список
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict):
+                for key in ("cheques", "items", "results", "data"):
+                    if isinstance(data.get(key), list):
+                        return data[key]
+            return []
+        except Exception as e:
+            log.warning("list path %s failed: %s", p, getattr(e, "status", "?"))
+            continue
+    return []
+
+
+async def get_app_balance() -> dict | None:
+    """Пытается получить баланс приложения xRocket."""
+    paths = [
+        "/api/v1/app/balance",
+        "/api/v1/balance",
+        "/api/v1/me",
+    ]
+    for p in paths:
+        try:
+            data = await xrocket_request("GET", p)
+            log.info("get_app_balance %s -> %s", p, str(data)[:300])
+            return {"path": p, "data": data}
+        except Exception as e:
+            log.warning("balance path %s failed: %s", p, getattr(e, "status", "?"))
+            continue
+    return None
 
 
 def xrocket_error_text(e: Exception) -> str:
@@ -166,21 +207,24 @@ def xrocket_error_text(e: Exception) -> str:
     kind = data.get("kind") or ""
     title = data.get("title") or ""
     detail = data.get("detail") or str(e)
+    path = getattr(e, "path", "")
+    status = getattr(e, "status", "?")
 
     if "amount_more_than_app_balance" in str(data) or "more than app balance" in detail.lower():
         return (
             "⚠️ На балансе приложения xRocket недостаточно средств.\n\n"
-            "Пополни приложение: открой @xRocket → Wallet → пополни USDT, "
-            "или переведи с основного баланса на баланс приложения (App 302777)."
+            "Пополни приложение: @xRocket → Wallet."
         )
     if "operation_disabled" in kind or "disabled" in detail.lower():
         return (
             "⚠️ xRocket отключил эту операцию для твоего приложения.\n\n"
             "Проверь Permissions / Operations в @xRocket → xRocket API → 302777."
         )
+    if status == 404:
+        return f"⚠️ xRocket вернул 404 по пути {path}. Endpoint не найден."
     if "forbidden" in kind:
         return f"⚠️ xRocket запретил операцию: {detail}"
-    return f"⚠️ Ошибка xRocket: {title or detail}"
+    return f"⚠️ xRocket {status} {path}: {title or detail}"
 
 
 # ============ /start ============
@@ -297,7 +341,6 @@ async def cmd_start(message: Message):
         "/balance — баланс банка",
         "/topup 1 — пополнить банк на 1 USDT",
         "/salary 1 3 — раздать 1 USDT топ-3",
-        "/salary — раздать весь банк всем активным",
     ]
     if is_admin(user.id):
         help_lines += [
@@ -306,10 +349,11 @@ async def cmd_start(message: Message):
             "/admin — справка по админке",
             "/setbal 5 — установить баланс (себе)",
             "/addbal 1 — прибавить к балансу (себе)",
-            "/setbal_pet &lt;pet_id&gt; 5 — установить баланс питомцу",
             "/list_pets — список всех питомцев",
             "/reset_scores — обнулить дневные очки",
-            "/cancel_cheques — отменить все висящие чеки и вернуть деньги",
+            "/cheques — список активных чеков",
+            "/cancel_cheques — отменить все висящие чеки",
+            "/xr — посмотреть баланс приложения xRocket",
         ]
 
     await message.answer(
@@ -410,7 +454,7 @@ async def cmd_topup(message: Message):
     try:
         amount = float(parts[1].replace(",", "."))
     except ValueError:
-        await message.answer("Не могу разобрать сумму. Пример: /topup 1")
+        await message.answer("Не могу разобрать сумму.")
         return
     if amount <= 0 or amount > 1000:
         await message.answer("Сумма должна быть от 0.01 до 1000 USDT")
@@ -535,8 +579,7 @@ async def run_salary_pet(pet_id: str, owner_id: int, amount: float | None, top_n
             f"❌ Слишком мелкие чеки.\n\n"
             f"Сумма: {amount:.4f}, получателей: {len(winners)}, "
             f"минимальная доля: {min_share:.4f} USDT.\n\n"
-            f"Минимум на один чек: {MIN_CHEQUE} USDT.\n"
-            f"Уменьши число получателей или увеличь сумму."
+            f"Минимум на один чек: {MIN_CHEQUE} USDT."
         )
         return
 
@@ -645,14 +688,13 @@ async def cmd_admin(message: Message):
         return
     await message.answer(
         "🛠 <b>Админ-команды</b>\n\n"
-        "/setbal 5 — установить баланс (своему питомцу)\n"
+        "/setbal 5 — установить баланс\n"
         "/addbal 1 — прибавить к балансу\n"
-        "/setbal_pet &lt;pet_id&gt; 5 — установить баланс питомцу по ID\n"
-        "/addbal_pet &lt;pet_id&gt; 1 — прибавить питомцу по ID\n"
-        "/list_pets — все питомцы с балансами\n"
-        "/reset_scores — обнулить today_score у всех\n"
-        "/cancel_cheques — отменить все висящие чеки и вернуть деньги\n"
-        "/cheques — список висящих чеков",
+        "/list_pets — все питомцы\n"
+        "/reset_scores — обнулить дневные очки\n"
+        "/cheques — список активных чеков\n"
+        "/cancel_cheques — отменить все висящие чеки\n"
+        "/xr — баланс приложения xRocket",
         parse_mode="HTML"
     )
 
@@ -700,57 +742,6 @@ async def cmd_addbal(message: Message):
     await message.answer(f"✅ Баланс питомца «{pet['name']}»: {new_balance:.4f} USDT")
 
 
-@dp.message(Command("setbal_pet"))
-async def cmd_setbal_pet(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.answer("Использование: /setbal_pet <pet_id> 5")
-        return
-    pet_id = parts[1].strip()
-    try:
-        amount = float(parts[2].replace(",", "."))
-    except ValueError:
-        await message.answer("Не могу разобрать сумму.")
-        return
-    if len(pet_id) < 30:
-        await message.answer("Похоже, это не UUID. Возьми ID из /list_pets.")
-        return
-    pet = one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet:
-        await message.answer("Питомец с таким ID не найден.")
-        return
-    sb.table("pets").update({"bank_balance": amount}).eq("id", pet_id).execute()
-    await message.answer(f"✅ «{pet['name']}»: {amount:.4f} USDT")
-
-
-@dp.message(Command("addbal_pet"))
-async def cmd_addbal_pet(message: Message):
-    if not is_admin(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.answer("Использование: /addbal_pet <pet_id> 1")
-        return
-    pet_id = parts[1].strip()
-    try:
-        amount = float(parts[2].replace(",", "."))
-    except ValueError:
-        await message.answer("Не могу разобрать сумму.")
-        return
-    if len(pet_id) < 30:
-        await message.answer("Похоже, это не UUID. Возьми ID из /list_pets.")
-        return
-    pet = one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet:
-        await message.answer("Питомец с таким ID не найден.")
-        return
-    new_balance = float(pet.get("bank_balance") or 0) + amount
-    sb.table("pets").update({"bank_balance": new_balance}).eq("id", pet_id).execute()
-    await message.answer(f"✅ «{pet['name']}»: {new_balance:.4f} USDT")
-
-
 @dp.message(Command("list_pets"))
 async def cmd_list_pets(message: Message):
     if not is_admin(message.from_user.id):
@@ -763,8 +754,7 @@ async def cmd_list_pets(message: Message):
     for p in pets[:30]:
         lines.append(
             f"• <code>{p['id']}</code>\n"
-            f"  {p['name']} — {float(p.get('bank_balance') or 0):.4f} USDT "
-            f"(xp {p.get('xp') or 0})"
+            f"  {p['name']} — {float(p.get('bank_balance') or 0):.4f} USDT"
         )
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -778,35 +768,71 @@ async def cmd_reset_scores(message: Message):
     await message.answer("✅ Дневные очки обнулены у всех.")
 
 
-@dp.message(Command("cheques"))
-async def cmd_cheques(message: Message):
-    """Список активных чеков."""
+# ============ /xr — диагностика xRocket ============
+
+@dp.message(Command("xr"))
+async def cmd_xr(message: Message):
     if not is_admin(message.from_user.id):
         return
-    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
-    if not pet:
-        await message.answer("У тебя нет питомца.")
-        return
+    await message.answer("🔍 Проверяю xRocket…")
 
-    cheques = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status", "sent"))
-    if not cheques:
-        await message.answer("Активных чеков нет.")
-        return
+    bal = await get_app_balance()
+    cheques = await list_xrocket_cheques()
 
-    lines = ["🧾 <b>Активные чеки:</b>\n"]
-    for c in cheques[:20]:
-        lines.append(
-            f"• <code>{c.get('cheque_id')}</code>\n"
-            f"  {float(c.get('amount') or 0):.4f} USDT → user <code>{c['user_id']}</code>"
-        )
-    lines.append(f"\nВсего: {len(cheques)}")
-    lines.append("Отменить все: /cancel_cheques")
+    lines = ["<b>📊 xRocket диагностика</b>\n"]
+
+    if bal:
+        lines.append(f"✅ Баланс найден через <code>{bal['path']}</code>")
+        lines.append(f"<pre>{str(bal['data'])[:500]}</pre>")
+    else:
+        lines.append("❌ Не удалось получить баланс ни через один из путей:")
+        lines.append("<code>/api/v1/app/balance</code>")
+        lines.append("<code>/api/v1/balance</code>")
+        lines.append("<code>/api/v1/me</code>")
+
+    lines.append(f"\n🧾 Активных чеков: {len(cheques)}")
+    for c in cheques[:10]:
+        cid = c.get("chequeId") or c.get("id")
+        amount = c.get("amount") or "?"
+        lines.append(f"• <code>{cid}</code> — {amount}")
+
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
+# ============ /cheques — из БД и xRocket ============
+
+@dp.message(Command("cheques"))
+async def cmd_cheques(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    lines = ["🧾 <b>Активные чеки</b>\n"]
+
+    # Из xRocket
+    xr = await list_xrocket_cheques()
+    lines.append(f"<b>Из xRocket:</b> {len(xr)}")
+    for c in xr[:10]:
+        cid = c.get("chequeId") or c.get("id")
+        amount = c.get("amount") or "?"
+        state = c.get("state") or "?"
+        lines.append(f"• <code>{cid}</code> — {amount} USDT [{state}]")
+
+    # Из БД
+    pet = one(sb.table("pets").select("*").eq("owner_id", message.from_user.id))
+    if pet:
+        db = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status", "sent"))
+        lines.append(f"\n<b>Из БД (sent):</b> {len(db)}")
+        for c in db[:10]:
+            lines.append(f"• <code>{c.get('cheque_id')}</code> — {float(c.get('amount') or 0):.4f}")
+
+    lines.append("\nОтменить всё: /cancel_cheques")
+    await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# ============ /cancel_cheques — главная ============
+
 @dp.message(Command("cancel_cheques"))
 async def cmd_cancel_cheques(message: Message):
-    """Отменяет все висящие чеки и возвращает деньги в банк питомца."""
     if not is_admin(message.from_user.id):
         return
 
@@ -815,34 +841,52 @@ async def cmd_cancel_cheques(message: Message):
         await message.answer("У тебя нет питомца.")
         return
 
-    cheques = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status", "sent"))
+    # 1) Чеки из xRocket API (там есть то, чего нет в БД)
+    xr_cheques = await list_xrocket_cheques()
+    log.info("cancel_cheques: from xRocket = %s", xr_cheques)
 
-    if not cheques:
-        await message.answer("Нет активных чеков для отмены.")
+    # 2) Чеки из БД
+    db_cheques = many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status", "sent"))
+
+    # Объединяем по cheque_id, чтобы не отменять дважды
+    all_ids = {}
+    for c in xr_cheques:
+        cid = c.get("chequeId") or c.get("id")
+        if cid:
+            all_ids[str(cid)] = {"id": str(cid), "amount": c.get("amount") or 0, "source": "xrocket"}
+    for c in db_cheques:
+        cid = c.get("cheque_id")
+        if cid and str(cid) not in all_ids:
+            all_ids[str(cid)] = {"id": str(cid), "amount": c.get("amount") or 0, "source": "db"}
+
+    if not all_ids:
+        await message.answer(
+            "Найти активные чеки не удалось.\n\n"
+            "Проверь вручную в @xRocket → Wallet → удерживается.\n"
+            "Посмотреть, что видит бот: /xr и /cheques"
+        )
         return
 
-    await message.answer(f"🔍 Найдено {len(cheques)} активных чеков. Пробую отменить...")
+    await message.answer(f"🔍 Найдено {len(all_ids)} чеков. Пробую отменить…")
 
     cancelled = 0
     failed = 0
     refund_amount = 0.0
     failed_ids = []
+    errors = []
 
-    for c in cheques:
-        cheque_id = c.get("cheque_id")
-        if not cheque_id:
-            continue
+    for cid, info in all_ids.items():
         try:
-            # Пробуем отменить чек через API xRocket
-            await delete_cheque(cheque_id)
-            sb.table("cheques").update({"status": "cancelled"}).eq("id", c["id"]).execute()
+            await delete_cheque(cid)
             cancelled += 1
-            refund_amount += float(c.get("amount") or 0)
-            log.info("Cancelled cheque %s", cheque_id)
+            refund_amount += float(info.get("amount") or 0)
+            sb.table("cheques").update({"status": "cancelled"}).eq("cheque_id", cid).execute()
+            log.info("Cancelled cheque %s", cid)
         except Exception as e:
-            log.error("Failed to cancel cheque %s: %s", cheque_id, e)
+            log.error("Failed to cancel %s: %s", cid, e)
             failed += 1
-            failed_ids.append(cheque_id)
+            failed_ids.append(cid)
+            errors.append(str(e)[:120])
 
     # Возвращаем зарезервированные деньги в банк питомца
     if refund_amount > 0:
@@ -860,6 +904,9 @@ async def cmd_cancel_cheques(message: Message):
     )
     if failed_ids:
         text += "\n\nНе удалось отменить:\n" + "\n".join(f"• <code>{i}</code>" for i in failed_ids[:10])
+    if errors:
+        text += "\n\nПоследняя ошибка: <code>" + errors[-1] + "</code>"
+
     await message.answer(text, parse_mode="HTML")
 
 
@@ -931,7 +978,6 @@ async def cmd_help(message: Message):
         "/balance — баланс банка\n"
         "/topup 1 — пополнить на 1 USDT\n"
         "/salary — раздать весь банк\n"
-        "/salary 1 — раздать 1 USDT всем\n"
         "/salary 1 3 — раздать 1 USDT топ-3",
         parse_mode="HTML"
     )
