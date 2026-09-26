@@ -44,16 +44,19 @@ def pick_link(obj: dict) -> str | None:
     if not obj:
         return None
     if isinstance(obj, dict):
-        for key in ("link", "url", "webLink", "botLink", "miniAppLink"):
-            v = obj.get(key)
-            if isinstance(v, str) and v.startswith("http"):
-                return v
+        # Сначала проверяем вложенный объект links
         links = obj.get("links") or {}
         if isinstance(links, dict):
-            for key in ("webLink", "telegramMiniAppLink", "botLink", "link", "url"):
+            # Приоритет: telegramBotLink (прямая ссылка на оплату в боте)
+            for key in ("telegramBotLink", "webLink", "telegramMiniAppLink", "link", "url"):
                 v = links.get(key)
                 if isinstance(v, str) and v.startswith("http"):
                     return v
+        # Затем проверяем поля верхнего уровня
+        for key in ("link", "url", "webLink", "telegramBotLink", "telegramMiniAppLink"):
+            v = obj.get(key)
+            if isinstance(v, str) and v.startswith("http"):
+                return v
     return None
 
 
@@ -81,11 +84,11 @@ async def xrocket_request(method: str, path: str, json: dict | None = None) -> d
 async def create_invoice(amount: float, currency: str, description: str) -> dict:
     """Создать инвойс для пополнения банка."""
     payload = {
-        "amount": str(amount),
-        "currency": currency,
+        "priceAmount": str(amount),
+        "priceCurrency": currency,
         "description": description,
-        "hiddenMessage": "Спасибо! Банк питомца пополнен.",
-        "commentsEnabled": False,
+        "numPayments": 1,
+        "expiresIn": 3600000,  # 1 час в миллисекундах
     }
     data = await xrocket_request("POST", "/api/v1/invoices", payload)
     log.info("xRocket invoice response: %s", data)
@@ -95,8 +98,8 @@ async def create_invoice(amount: float, currency: str, description: str) -> dict
 async def create_cheque(user_id: int, amount: float, currency: str, description: str) -> dict:
     """Создать персональный чек для участника."""
     payload = {
+        "asset": currency,
         "amount": str(amount),
-        "currency": currency,
         "description": description,
         "targetType": "telegram_user_id",
         "target": str(user_id),
