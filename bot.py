@@ -154,7 +154,10 @@ async def create_invoice(amount, currency, description):
 
 
 async def get_invoice_status(iid):
-    return await xrocket_request("GET", f"/api/v1/invoices/{iid}")
+    """Получить информацию об инвойсе по его ID.
+    Актуальный эндпоинт: GET /api/v1/invoice?invoiceId={id}
+    """
+    return await xrocket_request("GET", f"/api/v1/invoice?invoiceId={iid}")
 
 
 async def create_cheque(uid, amount, currency, description):
