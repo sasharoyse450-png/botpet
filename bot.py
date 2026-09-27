@@ -38,7 +38,6 @@ XROCKET_TOKEN = os.environ["XROCKET_TOKEN"]
 XROCKET_API   = os.environ.get("XROCKET_API", "https://pay.api.xrocket.exchange")
 PORT          = int(os.environ.get("PORT", 8080))
 
-# CORS: откуда фронт имеет право стучаться в /api/*
 ALLOWED_ORIGINS = os.environ.get(
     "ALLOWED_ORIGINS",
     "https://sasharoyse450-png.github.io"
@@ -104,6 +103,14 @@ async def many(q):
         log.warning("many(): %s", e); return []
 
 
+async def one_two(q1, q2):
+    """Параллельно два запроса .limit(1)."""
+    r1, r2 = await asyncio.gather(q1.limit(1).execute(), q2.limit(1).execute(), return_exceptions=True)
+    d1 = getattr(r1, "data", None) or [] if not isinstance(r1, Exception) else []
+    d2 = getattr(r2, "data", None) or [] if not isinstance(r2, Exception) else []
+    return (d1[0] if d1 else None), (d2[0] if d2 else None)
+
+
 async def my_pets(uid, alive_only=False):
     q = sb.table("pets").select("*").eq("owner_id", uid)
     if alive_only: q = q.eq("dead", False)
@@ -143,43 +150,36 @@ async def resolve_pet(message: Message, args: list):
 
 
 # ============================================================
-# ПРОВЕРКА Telegram initData (HMAC)
+# initData HMAC
 # ============================================================
 
-def verify_init_data(init_data: str) -> dict | None:
-    """Проверяет подпись initData и возвращает user-dict или None."""
-    if not init_data:
-        return None
+def verify_init_data(init_data: str):
+    if not init_data: return None
     try:
         pairs = dict(parse_qsl(init_data, keep_blank_values=True))
     except Exception:
         return None
     received_hash = pairs.pop("hash", None)
-    if not received_hash:
-        return None
+    if not received_hash: return None
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
     secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
     calc_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calc_hash, received_hash):
-        return None
+    if not hmac.compare_digest(calc_hash, received_hash): return None
     try:
         auth_date = int(pairs.get("auth_date", "0"))
     except Exception:
         return None
-    if abs(time.time() - auth_date) > 48 * 3600:
-        return None
+    if abs(time.time() - auth_date) > 48 * 3600: return None
     try:
         user = json.loads(pairs.get("user", "{}"))
     except Exception:
         return None
-    if not user or not user.get("id"):
-        return None
+    if not user or not user.get("id"): return None
     return user
 
 
-def get_user_from_request(request: web.Request) -> dict | None:
-    init_data = request.headers.get("X-Telegram-Init-Data", "")
-    return verify_init_data(init_data)
+def get_user_from_request(request: web.Request):
+    return verify_init_data(request.headers.get("X-Telegram-Init-Data", ""))
 
 
 def json_error(msg: str, status: int = 400):
@@ -369,10 +369,6 @@ async def cmd_start(message: Message):
             [InlineKeyboardButton(text="📋 Мои питомцы", callback_data="my_pets")]]))
 
 
-# ============================================================
-# проверка оплаты
-# ============================================================
-
 @dp.callback_query(F.data.startswith("check_"))
 async def cb_check_payment(call: CallbackQuery):
     iid = call.data[6:]; user = call.from_user
@@ -417,7 +413,7 @@ async def cb_check_payment(call: CallbackQuery):
 
 
 # ============================================================
-# тики и смерть
+# тики
 # ============================================================
 
 def _stage_idx(level):
@@ -890,7 +886,7 @@ async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
 
 
 # ============================================================
-# АДМИНКА (без изменений)
+# АДМИНКА
 # ============================================================
 
 @dp.message(Command("admin"))
@@ -1275,7 +1271,7 @@ async def cmd_xr(m: Message):
 
 
 # ============================================================
-# create / my_pets (callback)
+# create / my_pets
 # ============================================================
 
 @dp.callback_query(F.data == "create")
@@ -1347,43 +1343,70 @@ async def cmd_help(m: Message):
 
 
 # ============================================================
-# API ДЛЯ ФРОНТА (initData HMAC)
+# ОПТИМИЗИРОВАННЫЙ API ДЛЯ ФРОНТА
 # ============================================================
 
-async def api_tick(request: web.Request):
+async def _log_event_bg(pet_id, user_id, first_name, action):
+    """Fire-and-forget: пишет событие, ошибки глотает."""
+    try:
+        await sb.table("events").insert({
+            "pet_id": pet_id, "user_id": user_id,
+            "first_name": first_name or "Гость", "action": action,
+        }).execute()
+    except Exception as e:
+        log.warning("event insert: %s", e)
+
+
+async def api_open(request: web.Request):
+    """Один эндпоинт для открытия питомца: параллельно читает pet+me,
+    при необходимости создаёт member, применяет tick и пишет БД.
+    """
     user = get_user_from_request(request)
     if not user: return json_error("unauthorized", 401)
     try: body = await request.json()
     except: return json_error("bad json")
     pet_id = body.get("pet_id")
     if not pet_id: return json_error("pet_id required")
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+
+    # 1. Параллельно: pet + member
+    pet_task = sb.table("pets").select("*").eq("id", pet_id).limit(1).execute()
+    mem_task = sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]).limit(1).execute()
+    r_pet, r_mem = await asyncio.gather(pet_task, mem_task, return_exceptions=True)
+    pet = (getattr(r_pet, "data", None) or [None])[0] if not isinstance(r_pet, Exception) else None
+    mem = (getattr(r_mem, "data", None) or [None])[0] if not isinstance(r_mem, Exception) else None
+
     if not pet: return json_error("pet not found", 404)
+
+    # 2. Если я не member — создаю (это часть "join")
+    joined = False
+    if not mem:
+        try:
+            res = await sb.table("members").insert({
+                "pet_id": pet_id, "user_id": user["id"],
+                "username": user.get("username"),
+                "first_name": user.get("first_name") or "Гость",
+                "score": 0,
+            }).execute()
+            mem = res.data[0] if res.data else None
+            joined = True
+        except Exception as e:
+            log.warning("member insert: %s", e)
+
+    # 3. Tick (если нужен) — точечно пишем в БД
     if not pet.get("dead"):
-        pet = await save_pet_tick(pet)
-    return web.json_response({"ok": True, "pet": pet})
+        ticked = apply_pet_tick(pet)
+        if ticked.get("last_tick_at") != pet.get("last_tick_at") or ticked.get("dead"):
+            upd = {
+                "hunger": ticked["hunger"], "mood": ticked["mood"],
+                "energy": ticked["energy"], "clean": ticked["clean"],
+                "health": ticked["health"], "last_tick_at": ticked["last_tick_at"],
+            }
+            if ticked.get("dead"):
+                upd["dead"] = True; upd["dead_at"] = ticked.get("dead_at")
+            await sb.table("pets").update(upd).eq("id", pet_id).execute()
+            pet = ticked
 
-
-async def api_join(request: web.Request):
-    user = get_user_from_request(request)
-    if not user: return json_error("unauthorized", 401)
-    try: body = await request.json()
-    except: return json_error("bad json")
-    pet_id = body.get("pet_id")
-    if not pet_id: return json_error("pet_id required")
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet: return json_error("pet not found", 404)
-    existing = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
-    if existing:
-        return web.json_response({"ok": True, "me": existing, "pet": pet, "joined": False})
-    res = await sb.table("members").insert({
-        "pet_id": pet_id, "user_id": user["id"],
-        "username": user.get("username"),
-        "first_name": user.get("first_name") or "Гость",
-        "score": 0,
-    }).execute()
-    me = res.data[0] if res.data else None
-    return web.json_response({"ok": True, "me": me, "pet": pet, "joined": True})
+    return web.json_response({"ok": True, "pet": pet, "me": mem, "joined": joined})
 
 
 async def api_action(request: web.Request):
@@ -1395,16 +1418,21 @@ async def api_action(request: web.Request):
     action = body.get("action")
     if not pet_id or action not in PET_ACTIONS:
         return json_error("invalid params")
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet: return json_error("pet not found", 404)
-    if pet.get("dead"): return json_error("pet is dead", 400)
-    pet = await save_pet_tick(pet)
-    if pet.get("dead"): return json_error("pet died during tick", 400)
 
-    mem = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
+    # 1. Параллельно: pet + me
+    pet_task = sb.table("pets").select("*").eq("id", pet_id).limit(1).execute()
+    mem_task = sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]).limit(1).execute()
+    r_pet, r_mem = await asyncio.gather(pet_task, mem_task, return_exceptions=True)
+    pet = (getattr(r_pet, "data", None) or [None])[0] if not isinstance(r_pet, Exception) else None
+    mem = (getattr(r_mem, "data", None) or [None])[0] if not isinstance(r_mem, Exception) else None
+
+    if not pet: return json_error("pet not found", 404)
     if not mem: return json_error("not a member", 403)
+    if pet.get("dead"): return json_error("pet is dead", 400)
 
     cfg = PET_ACTIONS[action]
+
+    # 2. Проверка кулдауна
     last_key = "last_" + action + "_at"
     ls = mem.get(last_key)
     if ls:
@@ -1419,47 +1447,81 @@ async def api_action(request: web.Request):
     if cfg.get("cost") and score < cfg["cost"]:
         return json_error(f"need {cfg['cost']} score", 400)
 
-    new_pet = dict(pet)
+    # 3. Применяем tick в памяти (БЕЗ записи), потом эффект
+    ticked = apply_pet_tick(pet)
+    if ticked.get("dead"):
+        # пишем только смерть
+        await sb.table("pets").update({
+            "hunger": ticked["hunger"], "mood": ticked["mood"],
+            "energy": ticked["energy"], "clean": ticked["clean"],
+            "health": 0, "last_tick_at": ticked["last_tick_at"],
+            "dead": True, "dead_at": ticked.get("dead_at"),
+        }).eq("id", pet_id).execute()
+        return json_error("pet died during tick", 400)
+
+    new_pet = dict(ticked)
     for k, v in cfg["effects"].items():
         new_pet[k] = max(0, min(100, (new_pet.get(k) or 0) + v))
-    new_pet["xp"] = (pet.get("xp") or 0) + cfg["xp"]
+    new_pet["xp"] = (ticked.get("xp") or 0) + cfg["xp"]
+
     old_st = _stage_idx(min(30, (pet.get("xp") or 0) // 50 + 1))
     new_st = _stage_idx(min(30, new_pet["xp"] // 50 + 1))
-
-    await sb.table("pets").update({
-        "hunger": new_pet["hunger"], "mood": new_pet["mood"],
-        "energy": new_pet["energy"], "clean": new_pet["clean"],
-        "health": new_pet["health"], "xp": new_pet["xp"],
-        "last_tick_at": new_pet["last_tick_at"],
-    }).eq("id", pet_id).execute()
 
     iso_now = datetime.now(timezone.utc).isoformat()
     today_iso = datetime.now(timezone.utc).date().isoformat()
     new_score = score + cfg["score"]
+
     m_upd = {"score": new_score, last_key: iso_now}
     if mem.get("today_date") == today_iso:
         m_upd["today_score"] = (mem.get("today_score") or 0) + max(cfg["score"], 0)
     else:
         m_upd["today_score"] = max(cfg["score"], 0)
         m_upd["today_date"] = today_iso
-    await sb.table("members").update(m_upd).eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
 
-    try:
-        await sb.table("events").insert({
-            "pet_id": pet_id, "user_id": user["id"],
-            "first_name": user.get("first_name") or "Гость",
-            "action": action,
-        }).execute()
-    except: pass
+    # 4. Параллельно пишем оба — и сразу получаем обновлённые строки
+    p_upd = {
+        "hunger": new_pet["hunger"], "mood": new_pet["mood"],
+        "energy": new_pet["energy"], "clean": new_pet["clean"],
+        "health": new_pet["health"], "xp": new_pet["xp"],
+        "last_tick_at": new_pet["last_tick_at"],
+    }
+    r1, r2 = await asyncio.gather(
+        sb.table("pets").update(p_upd).eq("id", pet_id).select().execute(),
+        sb.table("members").update(m_upd).eq("pet_id", pet_id).eq("user_id", user["id"]).select().execute(),
+        return_exceptions=True,
+    )
+    pet_updated = (getattr(r1, "data", None) or [None])[0] if not isinstance(r1, Exception) else None
+    mem_updated = (getattr(r2, "data", None) or [None])[0] if not isinstance(r2, Exception) else None
+    if not pet_updated:
+        pet_updated = {**pet, **p_upd}
+    if not mem_updated:
+        mem_updated = {**mem, **m_upd}
 
-    pet_updated = await one(sb.table("pets").select("*").eq("id", pet_id))
-    mem_updated = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
+    # 5. Лента — в фоне, не ждём
+    asyncio.create_task(_log_event_bg(
+        pet_id, user["id"], user.get("first_name") or "Гость", action
+    ))
+
     return web.json_response({
         "ok": True,
         "pet": pet_updated,
         "me": mem_updated,
         "evolved": new_st > old_st,
     })
+
+
+async def api_tick(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    if not pet_id: return json_error("pet_id required")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("pet not found", 404)
+    if not pet.get("dead"):
+        pet = await save_pet_tick(pet)
+    return web.json_response({"ok": True, "pet": pet})
 
 
 async def api_daily(request: web.Request):
@@ -1487,10 +1549,15 @@ async def api_daily(request: web.Request):
         except: pass
     now = datetime.now(timezone.utc).isoformat()
     new_score = (mem.get("score") or 0) + DAILY_BONUS
-    await sb.table("members").update({
-        "score": new_score, "last_daily_at": now, "streak": streak,
-    }).eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
-    return web.json_response({"ok": True, "score": new_score, "streak": streak, "bonus": DAILY_BONUS})
+    upd = {"score": new_score, "last_daily_at": now, "streak": streak}
+    r = await sb.table("members").update(upd)\
+          .eq("pet_id", pet_id).eq("user_id", user["id"]).select().execute()
+    mem_updated = (r.data or [None])[0] if not isinstance(r, Exception) else None
+    if not mem_updated: mem_updated = {**mem, **upd}
+    return web.json_response({
+        "ok": True, "score": new_score, "streak": streak,
+        "bonus": DAILY_BONUS, "me": mem_updated,
+    })
 
 
 async def api_rename(request: web.Request):
@@ -1524,9 +1591,11 @@ async def api_skin(request: web.Request):
     if not mem: return json_error("not a member", 403)
     score = mem.get("score") or 0
     if score < SKIN_PRICE: return json_error(f"need {SKIN_PRICE} score", 400)
-    await sb.table("pets").update({"skin": new_skin}).eq("id", pet_id).execute()
     new_score = score - SKIN_PRICE
-    await sb.table("members").update({"score": new_score}).eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
+    await asyncio.gather(
+        sb.table("pets").update({"skin": new_skin}).eq("id", pet_id).execute(),
+        sb.table("members").update({"score": new_score}).eq("pet_id", pet_id).eq("user_id", user["id"]).execute(),
+    )
     return web.json_response({"ok": True, "skin": new_skin, "score": new_score})
 
 
@@ -1546,23 +1615,30 @@ async def api_revive(request: web.Request):
     score = mem.get("score") or 0
     if score < 100: return json_error("need 100 score", 400)
     now = datetime.now(timezone.utc).isoformat()
-    await sb.table("pets").update({
-        "dead": False, "dead_at": None,
-        "health": 50, "hunger": 50, "mood": 50, "clean": 50, "energy": 50,
-        "last_tick_at": now,
-    }).eq("id", pet_id).execute()
     new_score = score - 100
-    await sb.table("members").update({"score": new_score}).eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
+    await asyncio.gather(
+        sb.table("pets").update({
+            "dead": False, "dead_at": None,
+            "health": 50, "hunger": 50, "mood": 50, "clean": 50, "energy": 50,
+            "last_tick_at": now,
+        }).eq("id", pet_id).execute(),
+        sb.table("members").update({"score": new_score}).eq("pet_id", pet_id).eq("user_id", user["id"]).execute(),
+    )
     return web.json_response({"ok": True})
 
 
 async def api_create(request: web.Request):
     user = get_user_from_request(request)
     if not user: return json_error("unauthorized", 401)
-    existing = await my_pets(user["id"], alive_only=True)
+    # Параллельно: мои питомцы + count живых
+    existing_task = sb.table("pets").select("id").eq("owner_id", user["id"]).eq("dead", False).limit(1).execute()
+    count_task = sb.table("pets").select("id").eq("dead", False).execute()
+    r1, r2 = await asyncio.gather(existing_task, count_task, return_exceptions=True)
+    existing = (getattr(r1, "data", None) or []) if not isinstance(r1, Exception) else []
+    alive_count = len((getattr(r2, "data", None) or [])) if not isinstance(r2, Exception) else 0
     if existing: return json_error("already have pet", 400)
-    total = await count_alive_pets()
-    if total >= GLOBAL_PET_LIMIT: return json_error("limit reached", 400)
+    if alive_count >= GLOBAL_PET_LIMIT: return json_error("limit reached", 400)
+
     pet = None
     for _ in range(5):
         code = gen_code()
@@ -1607,11 +1683,12 @@ async def api_delete(request: web.Request):
     if not pet: return json_error("not found", 404)
     if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
     if confirm_name.strip() != pet["name"]: return json_error("name mismatch", 400)
-    for table in ["events","members","invoices","cheques","payouts","platform_fees"]:
-        try:
-            await sb.table(table).delete().eq("pet_id", pet_id).execute()
-        except Exception as e:
-            log.warning(f"cleanup {table}: {e}")
+    # параллельная очистка связанных
+    cleanup_tasks = [
+        sb.table(t).delete().eq("pet_id", pet_id).execute()
+        for t in ["events","members","invoices","cheques","payouts","platform_fees"]
+    ]
+    await asyncio.gather(*cleanup_tasks, return_exceptions=True)
     await sb.table("pets").delete().eq("id", pet_id).execute()
     return web.json_response({"ok": True})
 
@@ -1658,8 +1735,8 @@ async def start_web_server():
     app.router.add_get("/health", health)
     app.router.add_post("/webhook/xrocket", xrocket_webhook)
 
+    app.router.add_post("/api/open",   api_open)     # ← новый единый
     app.router.add_post("/api/tick",   api_tick)
-    app.router.add_post("/api/join",   api_join)
     app.router.add_post("/api/action", api_action)
     app.router.add_post("/api/daily",  api_daily)
     app.router.add_post("/api/rename", api_rename)
@@ -1673,7 +1750,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Web server on :%s (API + CORS ready)", PORT)
+    log.info("Web server on :%s (API + CORS ready, optimized)", PORT)
 
 
 async def main():
