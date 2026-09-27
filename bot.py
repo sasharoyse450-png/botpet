@@ -53,13 +53,9 @@ DAILY_BONUS = 20
 SKIN_PRICE = 50
 SKINS = ["classic", "cat", "space", "dino"]
 
-# ============================================================
-# АКСЕССУАРЫ — стоимость 1 Star
-# ============================================================
 ACCESSORY_PRICE_STARS = 1
 
 ACCESSORIES = {
-    # слот head
     "crown":      {"emoji": "👑", "slot": "head", "name": "Корона"},
     "tophat":     {"emoji": "🎩", "slot": "head", "name": "Цилиндр"},
     "cap":        {"emoji": "🧢", "slot": "head", "name": "Кепка"},
@@ -68,19 +64,15 @@ ACCESSORIES = {
     "helmet":     {"emoji": "⛑",  "slot": "head", "name": "Каска"},
     "pumpkin":    {"emoji": "🎃", "slot": "head", "name": "Тыква"},
     "party":      {"emoji": "🎉", "slot": "head", "name": "Хлопушка"},
-    # слот eyes
     "sunglasses": {"emoji": "🕶",  "slot": "eyes", "name": "Тёмные очки"},
     "nerd":       {"emoji": "👓", "slot": "eyes", "name": "Очки"},
     "goggles":    {"emoji": "🥽", "slot": "eyes", "name": "Маска"},
-    # слот neck
     "bow":        {"emoji": "🎀", "slot": "neck", "name": "Бантик"},
     "scarf":      {"emoji": "🧣", "slot": "neck", "name": "Шарф"},
     "medal":      {"emoji": "🏅", "slot": "neck", "name": "Медаль"},
     "beads":      {"emoji": "📿", "slot": "neck", "name": "Бусы"},
     "ribbon":     {"emoji": "🎗",  "slot": "neck", "name": "Ленточка"},
 }
-
-def accessory_slot(acc_id): return (ACCESSORIES.get(acc_id) or {}).get("slot")
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -438,12 +430,11 @@ async def cb_check_payment(call: CallbackQuery):
 
 
 # ============================================================
-# TELEGRAM STARS — покупка аксессуаров
+# TELEGRAM STARS
 # ============================================================
 
 @dp.pre_checkout_query()
 async def on_pre_checkout(q: PreCheckoutQuery):
-    """Подтверждаем — обязаны ответить в течение 10 секунд."""
     try:
         await q.answer(ok=True)
     except Exception as e:
@@ -452,7 +443,6 @@ async def on_pre_checkout(q: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def on_successful_payment(m: Message):
-    """Пришла оплата Stars — выдаём аксессуар."""
     sp = m.successful_payment
     payload = sp.invoice_payload or ""
     log.info("💫 Успешная оплата: %s (charge=%s, stars=%s)",
@@ -479,7 +469,7 @@ async def on_successful_payment(m: Message):
         owned.append(acc_id)
 
     equipped = dict(pet.get("accessories_equipped") or {})
-    equipped[acc["slot"]] = acc_id  # автонадеваем поверх того, что было в слоте
+    equipped[acc["slot"]] = acc_id
 
     await sb.table("pets").update({
         "accessories_owned": owned,
@@ -997,7 +987,8 @@ async def cmd_admin(m: Message):
         "<b>Скин:</b>\n"
         "/setskin [pet_id] classic|cat|space|dino\n\n"
         "<b>Аксессуары:</b>\n"
-        "/giveacc [pet_id] crown — выдать бесплатно\n"
+        "/giveacc [pet_id] crown — выдать один\n"
+        "/giveall [pet_id] — выдать ВСЕ\n"
         "/clearacc [pet_id] — снять всё\n\n"
         "<b>Смерть:</b>\n"
         "/revive [pet_id] · /kill [pet_id]\n\n"
@@ -1032,6 +1023,22 @@ async def cmd_giveacc(m: Message):
         "accessories_owned": owned, "accessories_equipped": equipped,
     }).eq("id", pet["id"]).execute()
     await m.answer(f"✅ Выдан {acc['emoji']} <b>{acc['name']}</b>\n{pet_line(pet)}", parse_mode="HTML")
+
+
+@dp.message(Command("giveall"))
+async def cmd_giveall(m: Message):
+    if not is_admin(m.from_user.id): return
+    args = m.text.split()[1:]
+    pet, _ = await resolve_pet(m, args)
+    if not pet: return
+    owned = list(ACCESSORIES.keys())
+    await sb.table("pets").update({
+        "accessories_owned": owned,
+    }).eq("id", pet["id"]).execute()
+    await m.answer(
+        f"✅ Выдал все <b>{len(owned)}</b> аксессуаров\n{pet_line(pet)}\n\n"
+        f"Открой приложение → 🎩 → выбирай и надевай.",
+        parse_mode="HTML")
 
 
 @dp.message(Command("clearacc"))
@@ -1788,7 +1795,6 @@ async def api_delete(request: web.Request):
 # ============================================================
 
 async def api_acc_list(request: web.Request):
-    """Список всех аксессуаров + что куплено/надето у питомца."""
     user = get_user_from_request(request)
     if not user: return json_error("unauthorized", 401)
     try: body = await request.json()
@@ -1813,7 +1819,6 @@ async def api_acc_list(request: web.Request):
 
 
 async def api_acc_buy(request: web.Request):
-    """Создаёт инвойс в Telegram Stars и возвращает URL для tg.openInvoice."""
     user = get_user_from_request(request)
     if not user: return json_error("unauthorized", 401)
     try: body = await request.json()
@@ -1842,31 +1847,27 @@ async def api_acc_buy(request: web.Request):
 
 
 async def api_acc_equip(request: web.Request):
-    """Надеть купленный аксессуар (без покупки)."""
     user = get_user_from_request(request)
     if not user: return json_error("unauthorized", 401)
     try: body = await request.json()
     except: return json_error("bad json")
     pet_id = body.get("pet_id")
     acc_id = body.get("accessory_id")
-    if not pet_id: return json_error("invalid params")
+    if not pet_id or not acc_id: return json_error("invalid params")
     pet = await one(sb.table("pets").select("*").eq("id", pet_id))
     if not pet: return json_error("not found", 404)
     if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
-    equipped = dict(pet.get("accessories_equipped") or {})
-    if acc_id is None or acc_id == "":
-        return json_error("accessory_id required")
     acc = ACCESSORIES.get(acc_id)
     if not acc: return json_error("unknown accessory", 404)
     owned = pet.get("accessories_owned") or []
     if acc_id not in owned: return json_error("not owned", 403)
+    equipped = dict(pet.get("accessories_equipped") or {})
     equipped[acc["slot"]] = acc_id
     await sb.table("pets").update({"accessories_equipped": equipped}).eq("id", pet_id).execute()
     return web.json_response({"ok": True, "equipped": equipped})
 
 
 async def api_acc_unequip(request: web.Request):
-    """Снять аксессуар с указанного слота."""
     user = get_user_from_request(request)
     if not user: return json_error("unauthorized", 401)
     try: body = await request.json()
@@ -1936,7 +1937,6 @@ async def start_web_server():
     app.router.add_post("/api/leave",  api_leave)
     app.router.add_post("/api/delete", api_delete)
 
-    # аксессуары
     app.router.add_post("/api/acc/list",     api_acc_list)
     app.router.add_post("/api/acc/buy",      api_acc_buy)
     app.router.add_post("/api/acc/equip",    api_acc_equip)
