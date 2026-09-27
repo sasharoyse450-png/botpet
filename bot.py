@@ -6,7 +6,7 @@ import hashlib
 import random
 import asyncio
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timezone, timedelta
 from urllib.parse import parse_qsl
 
 from aiogram import Bot, Dispatcher, F
@@ -14,7 +14,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    WebAppInfo, PreCheckoutQuery, LabeledPrice,
+    WebAppInfo,
 )
 from supabase import create_async_client, AsyncClient
 from aiohttp import web
@@ -53,26 +53,8 @@ DAILY_BONUS = 20
 SKIN_PRICE = 50
 SKINS = ["classic", "cat", "space", "dino"]
 
-ACCESSORY_PRICE_STARS = 1
-
-ACCESSORIES = {
-    "crown":      {"emoji": "👑", "slot": "head", "name": "Корона"},
-    "tophat":     {"emoji": "🎩", "slot": "head", "name": "Цилиндр"},
-    "cap":        {"emoji": "🧢", "slot": "head", "name": "Кепка"},
-    "grad":       {"emoji": "🎓", "slot": "head", "name": "Выпускник"},
-    "sunhat":     {"emoji": "👒", "slot": "head", "name": "Шляпка"},
-    "helmet":     {"emoji": "⛑",  "slot": "head", "name": "Каска"},
-    "pumpkin":    {"emoji": "🎃", "slot": "head", "name": "Тыква"},
-    "party":      {"emoji": "🎉", "slot": "head", "name": "Хлопушка"},
-    "sunglasses": {"emoji": "🕶",  "slot": "eyes", "name": "Тёмные очки"},
-    "nerd":       {"emoji": "👓", "slot": "eyes", "name": "Очки"},
-    "goggles":    {"emoji": "🥽", "slot": "eyes", "name": "Маска"},
-    "bow":        {"emoji": "🎀", "slot": "neck", "name": "Бантик"},
-    "scarf":      {"emoji": "🧣", "slot": "neck", "name": "Шарф"},
-    "medal":      {"emoji": "🏅", "slot": "neck", "name": "Медаль"},
-    "beads":      {"emoji": "📿", "slot": "neck", "name": "Бусы"},
-    "ribbon":     {"emoji": "🎗",  "slot": "neck", "name": "Ленточка"},
-}
+# === сколько часов без заботы до смерти ===
+DEATH_AFTER_HOURS = 24
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -430,69 +412,21 @@ async def cb_check_payment(call: CallbackQuery):
 
 
 # ============================================================
-# TELEGRAM STARS
-# ============================================================
-
-@dp.pre_checkout_query()
-async def on_pre_checkout(q: PreCheckoutQuery):
-    try:
-        await q.answer(ok=True)
-    except Exception as e:
-        log.warning("pre_checkout answer: %s", e)
-
-
-@dp.message(F.successful_payment)
-async def on_successful_payment(m: Message):
-    sp = m.successful_payment
-    payload = sp.invoice_payload or ""
-    log.info("💫 Успешная оплата: %s (charge=%s, stars=%s)",
-             payload, sp.telegram_payment_charge_id, sp.total_amount)
-
-    if not payload.startswith("buy_acc|"):
-        return
-
-    try:
-        _, pet_id, acc_id = payload.split("|", 2)
-    except Exception:
-        log.warning("bad payload: %s", payload); return
-
-    acc = ACCESSORIES.get(acc_id)
-    if not acc:
-        log.warning("unknown accessory: %s", acc_id); return
-
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet:
-        log.warning("pet not found: %s", pet_id); return
-
-    owned = list(pet.get("accessories_owned") or [])
-    if acc_id not in owned:
-        owned.append(acc_id)
-
-    equipped = dict(pet.get("accessories_equipped") or {})
-    equipped[acc["slot"]] = acc_id
-
-    await sb.table("pets").update({
-        "accessories_owned": owned,
-        "accessories_equipped": equipped,
-    }).eq("id", pet_id).execute()
-
-    try:
-        await m.answer(
-            f"✨ <b>{acc['name']}</b> — куплен и надет!\n"
-            f"{pet_line(pet)}\n\n"
-            f"Открой приложение, чтобы увидеть.",
-            parse_mode="HTML")
-    except Exception:
-        pass
-
-
-# ============================================================
-# тики
+# тики и смерть
 # ============================================================
 
 def _stage_idx(level):
     return 7 if level>=28 else 6 if level>=24 else 5 if level>=20 else 4 if level>=16 \
         else 3 if level>=12 else 2 if level>=8 else 1 if level>=4 else 0
+
+
+def _hours_since(dt_str):
+    if not dt_str: return None
+    try:
+        d = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - d).total_seconds() / 3600
+    except Exception:
+        return None
 
 
 def apply_pet_tick(pet):
@@ -523,8 +457,17 @@ def apply_pet_tick(pet):
     elif c["hunger"] > 60 and c["mood"] > 60 and c["clean"] > 60:
         c["health"] = cl((c.get("health") or 100) + 2*hours)
     c["last_tick_at"] = now.isoformat()
+
+    # ===== смерть через DEATH_AFTER_HOURS без заботы =====
+    care_hours = _hours_since(c.get("last_care_at") or pet.get("last_care_at"))
+    if care_hours is not None and care_hours >= DEATH_AFTER_HOURS:
+        c["health"] = 0
+        c["dead"] = True
+        c["dead_at"] = now.isoformat()
+
     if c["health"] <= 0:
-        c["health"] = 0; c["dead"] = True; c["dead_at"] = now.isoformat()
+        c["health"] = 0; c["dead"] = True
+        if not c.get("dead_at"): c["dead_at"] = now.isoformat()
     return c
 
 
@@ -565,10 +508,16 @@ async def death_watch_loop():
                     if ticked.get("dead"):
                         log.info("💀 умер: %s", pet["name"])
                         try:
+                            care_hours = _hours_since(pet.get("last_care_at"))
+                            reason = ""
+                            if care_hours is not None and care_hours >= DEATH_AFTER_HOURS:
+                                reason = f"Ты не заботился о нём больше {DEATH_AFTER_HOURS} часов."
+                            else:
+                                reason = "Ты слишком долго не заботился."
                             await bot.send_message(
                                 pet["owner_id"],
                                 f"💀 <b>{escape_html(pet['name'])} умер…</b>\n\n"
-                                f"Ты слишком долго не заботился.\n"
+                                f"{reason}\n"
                                 f"Возроди его в приложении за 100 очков.",
                                 parse_mode="HTML")
                         except Exception as e:
@@ -615,6 +564,16 @@ PET_STAGE_NAMES = {
 }
 
 
+def _care_left_text(pet):
+    """Сколько осталось до смерти"""
+    h = _hours_since(pet.get("last_care_at"))
+    if h is None: return ""
+    left = DEATH_AFTER_HOURS - h
+    if left <= 0: return "⚠️ Умирает"
+    if left < 1: return f"⏰ До смерти: {int(left*60)} мин"
+    return f"⏰ До смерти: {int(left)} ч"
+
+
 async def _send_pet_info(message, pet):
     pet = await save_pet_tick(pet)
     if pet.get("dead"):
@@ -622,6 +581,7 @@ async def _send_pet_info(message, pet):
     lvl = min(30, (pet.get("xp") or 0) // 50 + 1)
     st = _stage_idx(lvl)
     names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
+    care = _care_left_text(pet)
     text = (
         f"🐾 <b>{pet['name']}</b> · {names[st]} · ур. {lvl}\n\n"
         f"🍖 Сытость: {pet.get('hunger',0)}%\n"
@@ -629,6 +589,7 @@ async def _send_pet_info(message, pet):
         f"⚡ Энергия: {pet.get('energy',0)}%\n"
         f"🧼 Чистота: {pet.get('clean',0)}%\n"
         f"❤️ Здоровье: {pet.get('health',0)}%\n\n"
+        f"{care}\n\n"
         f"<code>/pet {pet['name']} kd</code> — кулдауны"
     )
     await message.answer(text, parse_mode="HTML")
@@ -764,14 +725,15 @@ async def cmd_pet(message: Message):
     old_st = _stage_idx(min(30, (pet.get("xp") or 0) // 50 + 1))
     new_st = _stage_idx(min(30, new_pet["xp"] // 50 + 1))
 
+    iso_now = datetime.now(timezone.utc).isoformat()
     await sb.table("pets").update({
         "hunger": new_pet["hunger"], "mood": new_pet["mood"],
         "energy": new_pet["energy"], "clean": new_pet["clean"],
         "health": new_pet["health"], "xp": new_pet["xp"],
         "last_tick_at": new_pet["last_tick_at"],
+        "last_care_at": iso_now,
     }).eq("id", pet["id"]).execute()
 
-    iso_now = datetime.now(timezone.utc).isoformat()
     today_iso = datetime.now(timezone.utc).date().isoformat()
     new_score = score + cfg["score"]
     m_upd = {"score": new_score, last_key: iso_now}
@@ -968,7 +930,8 @@ async def cmd_admin(m: Message):
     alive = await count_alive_pets()
     await m.answer(
         f"🛠 <b>Админка</b>\n\n"
-        f"Живых питомцев: <b>{alive} / {GLOBAL_PET_LIMIT}</b>\n\n"
+        f"Живых питомцев: <b>{alive} / {GLOBAL_PET_LIMIT}</b>\n"
+        f"Смерть без заботы: <b>{DEATH_AFTER_HOURS} ч</b>\n\n"
         "<b>Инфо:</b>\n"
         "/my_pets_admin — мои питомцы с ID\n"
         "/list_pets — все питомцы\n"
@@ -986,10 +949,9 @@ async def cmd_admin(m: Message):
         "/addbal [pet_id] 1\n\n"
         "<b>Скин:</b>\n"
         "/setskin [pet_id] classic|cat|space|dino\n\n"
-        "<b>Аксессуары:</b>\n"
-        "/giveacc [pet_id] crown — выдать один\n"
-        "/giveall [pet_id] — выдать ВСЕ\n"
-        "/clearacc [pet_id] — снять всё\n\n"
+        "<b>Забота (таймер 24ч):</b>\n"
+        "/feed24 [pet_id] — сбросить таймер (питомец не умрёт)\n"
+        "/hoursleft [pet_id] — сколько часов осталось\n\n"
         "<b>Смерть:</b>\n"
         "/revive [pet_id] · /kill [pet_id]\n\n"
         "<b>Прочее:</b>\n"
@@ -1001,56 +963,37 @@ async def cmd_admin(m: Message):
         parse_mode="HTML")
 
 
-@dp.message(Command("giveacc"))
-async def cmd_giveacc(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if not rest:
-        accs = "\n".join(f"• <code>{k}</code> — {v['emoji']} {v['name']} ({v['slot']})"
-                         for k, v in ACCESSORIES.items())
-        await m.answer(f"Формат: /giveacc [pet_id] crown\n\n<b>Доступные:</b>\n{accs}", parse_mode="HTML"); return
-    acc_id = rest[0].strip().lower()
-    acc = ACCESSORIES.get(acc_id)
-    if not acc:
-        await m.answer(f"Нет такого аксессуара: <code>{acc_id}</code>"); return
-    owned = list(pet.get("accessories_owned") or [])
-    if acc_id not in owned: owned.append(acc_id)
-    equipped = dict(pet.get("accessories_equipped") or {})
-    equipped[acc["slot"]] = acc_id
-    await sb.table("pets").update({
-        "accessories_owned": owned, "accessories_equipped": equipped,
-    }).eq("id", pet["id"]).execute()
-    await m.answer(f"✅ Выдан {acc['emoji']} <b>{acc['name']}</b>\n{pet_line(pet)}", parse_mode="HTML")
-
-
-@dp.message(Command("giveall"))
-async def cmd_giveall(m: Message):
+@dp.message(Command("feed24"))
+async def cmd_feed24(m: Message):
     if not is_admin(m.from_user.id): return
     args = m.text.split()[1:]
     pet, _ = await resolve_pet(m, args)
     if not pet: return
-    owned = list(ACCESSORIES.keys())
+    now = datetime.now(timezone.utc).isoformat()
     await sb.table("pets").update({
-        "accessories_owned": owned,
+        "last_care_at": now,
+        "last_tick_at": now,
     }).eq("id", pet["id"]).execute()
+    await m.answer(f"✅ Таймер заботы сброшен на 24ч\n{pet_line(pet)}", parse_mode="HTML")
+
+
+@dp.message(Command("hoursleft"))
+async def cmd_hoursleft(m: Message):
+    if not is_admin(m.from_user.id): return
+    args = m.text.split()[1:]
+    pet, _ = await resolve_pet(m, args)
+    if not pet: return
+    h = _hours_since(pet.get("last_care_at"))
+    if h is None:
+        await m.answer("Нет данных last_care_at."); return
+    left = DEATH_AFTER_HOURS - h
+    if left <= 0:
+        await m.answer(f"💀 Уже должен был умереть. Умрёт в течение следующих 30 мин (тик-цикл).")
+        return
     await m.answer(
-        f"✅ Выдал все <b>{len(owned)}</b> аксессуаров\n{pet_line(pet)}\n\n"
-        f"Открой приложение → 🎩 → выбирай и надевай.",
+        f"⏰ До смерти: <b>{left:.1f} ч</b>\n"
+        f"Последняя забота: {h:.1f} ч назад\n{pet_line(pet)}",
         parse_mode="HTML")
-
-
-@dp.message(Command("clearacc"))
-async def cmd_clearacc(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, _ = await resolve_pet(m, args)
-    if not pet: return
-    await sb.table("pets").update({
-        "accessories_owned": [], "accessories_equipped": {},
-    }).eq("id", pet["id"]).execute()
-    await m.answer(f"✅ Аксессуары сняты\n{pet_line(pet)}", parse_mode="HTML")
 
 
 @dp.message(Command("fees"))
@@ -1085,7 +1028,7 @@ async def cmd_revive(m: Message):
     await sb.table("pets").update({
         "dead": False, "dead_at": None,
         "health": 50, "hunger": 50, "mood": 50, "clean": 50, "energy": 50,
-        "last_tick_at": now,
+        "last_tick_at": now, "last_care_at": now,
     }).eq("id", pid).execute()
     await m.answer(f"✅ Возрождён: <code>{pid}</code>", parse_mode="HTML")
 
@@ -1112,7 +1055,9 @@ async def cmd_my_pets_admin(m: Message):
     for p in pets:
         lvl = min(30, (p.get("xp") or 0) // 50 + 1)
         dead = " 💀" if p.get("dead") else ""
-        lines.append(f"• <b>{p['name']}</b>{dead} · ур. {lvl}\n  <code>{p['id']}</code>\n"
+        h = _hours_since(p.get("last_care_at"))
+        left_txt = f" · ⏰{DEATH_AFTER_HOURS - h:.1f}ч" if h is not None and not p.get("dead") else ""
+        lines.append(f"• <b>{p['name']}</b>{dead} · ур. {lvl}{left_txt}\n  <code>{p['id']}</code>\n"
                      f"  Баланс: {float(p.get('bank_balance') or 0):.4f} · XP: {p.get('xp') or 0} · скин: {p.get('skin','classic')}")
     await m.answer("\n".join(lines), parse_mode="HTML")
 
@@ -1400,7 +1345,7 @@ async def cmd_xr(m: Message):
 
 
 # ============================================================
-# create / my_pets (callbacks)
+# create / my_pets
 # ============================================================
 
 @dp.callback_query(F.data == "create")
@@ -1416,7 +1361,11 @@ async def cb_create(call: CallbackQuery):
     for _ in range(5):
         code = gen_code()
         try:
-            r = await sb.table("pets").insert({"owner_id": user.id, "invite_code": code}).execute()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            r = await sb.table("pets").insert({
+                "owner_id": user.id, "invite_code": code,
+                "last_care_at": now_iso,
+            }).execute()
             if r.data: pet = r.data[0]; break
         except Exception as e:
             if "23505" not in str(e): break
@@ -1467,7 +1416,8 @@ async def cmd_help(m: Message):
         "• /pet — мои питомцы\n"
         "• /pet help — справка по чату\n"
         "• /pet имя покормить — покормить\n"
-        "• /pet имя kd — кулдауны",
+        "• /pet имя kd — кулдауны\n\n"
+        f"⚠️ <b>Питомец умирает через {DEATH_AFTER_HOURS} часов без заботы.</b>",
         parse_mode="HTML")
 
 
@@ -1601,6 +1551,7 @@ async def api_action(request: web.Request):
         "energy": new_pet["energy"], "clean": new_pet["clean"],
         "health": new_pet["health"], "xp": new_pet["xp"],
         "last_tick_at": new_pet["last_tick_at"],
+        "last_care_at": iso_now,
     }
 
     r1, r2 = await asyncio.gather(
@@ -1719,7 +1670,7 @@ async def api_revive(request: web.Request):
         sb.table("pets").update({
             "dead": False, "dead_at": None,
             "health": 50, "hunger": 50, "mood": 50, "clean": 50, "energy": 50,
-            "last_tick_at": now,
+            "last_tick_at": now, "last_care_at": now,
         }).eq("id", pet_id).execute(),
         sb.table("members").update({"score": new_score}).eq("pet_id", pet_id).eq("user_id", user["id"]).execute(),
     )
@@ -1741,7 +1692,11 @@ async def api_create(request: web.Request):
     for _ in range(5):
         code = gen_code()
         try:
-            r = await sb.table("pets").insert({"owner_id": user["id"], "invite_code": code}).execute()
+            now_iso = datetime.now(timezone.utc).isoformat()
+            r = await sb.table("pets").insert({
+                "owner_id": user["id"], "invite_code": code,
+                "last_care_at": now_iso,
+            }).execute()
             if r.data: pet = r.data[0]; break
         except Exception as e:
             if "23505" not in str(e): break
@@ -1788,101 +1743,6 @@ async def api_delete(request: web.Request):
     await asyncio.gather(*cleanup_tasks, return_exceptions=True)
     await sb.table("pets").delete().eq("id", pet_id).execute()
     return web.json_response({"ok": True})
-
-
-# ============================================================
-# АКСЕССУАРЫ — API
-# ============================================================
-
-async def api_acc_list(request: web.Request):
-    user = get_user_from_request(request)
-    if not user: return json_error("unauthorized", 401)
-    try: body = await request.json()
-    except: return json_error("bad json")
-    pet_id = body.get("pet_id")
-    if not pet_id: return json_error("pet_id required")
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet: return json_error("not found", 404)
-    items = []
-    for acc_id, acc in ACCESSORIES.items():
-        items.append({
-            "id": acc_id, "emoji": acc["emoji"], "slot": acc["slot"],
-            "name": acc["name"], "price": ACCESSORY_PRICE_STARS,
-        })
-    return web.json_response({
-        "ok": True,
-        "items": items,
-        "owned": pet.get("accessories_owned") or [],
-        "equipped": pet.get("accessories_equipped") or {},
-        "is_owner": pet["owner_id"] == user["id"],
-    })
-
-
-async def api_acc_buy(request: web.Request):
-    user = get_user_from_request(request)
-    if not user: return json_error("unauthorized", 401)
-    try: body = await request.json()
-    except: return json_error("bad json")
-    pet_id = body.get("pet_id")
-    acc_id = body.get("accessory_id")
-    if not pet_id or not acc_id: return json_error("invalid params")
-    acc = ACCESSORIES.get(acc_id)
-    if not acc: return json_error("unknown accessory", 404)
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet: return json_error("not found", 404)
-    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
-
-    try:
-        link = await bot.create_invoice_link(
-            title=f"{acc['emoji']} {acc['name']}",
-            description=f"Аксессуар для питомца «{pet['name']}»",
-            payload=f"buy_acc|{pet_id}|{acc_id}",
-            currency="XTR",
-            prices=[LabeledPrice(label=acc["name"], amount=ACCESSORY_PRICE_STARS)],
-        )
-    except Exception as e:
-        log.exception("create_invoice_link")
-        return json_error(f"telegram: {e}", 500)
-    return web.json_response({"ok": True, "invoice_url": link})
-
-
-async def api_acc_equip(request: web.Request):
-    user = get_user_from_request(request)
-    if not user: return json_error("unauthorized", 401)
-    try: body = await request.json()
-    except: return json_error("bad json")
-    pet_id = body.get("pet_id")
-    acc_id = body.get("accessory_id")
-    if not pet_id or not acc_id: return json_error("invalid params")
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet: return json_error("not found", 404)
-    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
-    acc = ACCESSORIES.get(acc_id)
-    if not acc: return json_error("unknown accessory", 404)
-    owned = pet.get("accessories_owned") or []
-    if acc_id not in owned: return json_error("not owned", 403)
-    equipped = dict(pet.get("accessories_equipped") or {})
-    equipped[acc["slot"]] = acc_id
-    await sb.table("pets").update({"accessories_equipped": equipped}).eq("id", pet_id).execute()
-    return web.json_response({"ok": True, "equipped": equipped})
-
-
-async def api_acc_unequip(request: web.Request):
-    user = get_user_from_request(request)
-    if not user: return json_error("unauthorized", 401)
-    try: body = await request.json()
-    except: return json_error("bad json")
-    pet_id = body.get("pet_id")
-    slot = body.get("slot")
-    if not pet_id or slot not in ("head", "eyes", "neck"):
-        return json_error("invalid params")
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet: return json_error("not found", 404)
-    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
-    equipped = dict(pet.get("accessories_equipped") or {})
-    equipped.pop(slot, None)
-    await sb.table("pets").update({"accessories_equipped": equipped}).eq("id", pet_id).execute()
-    return web.json_response({"ok": True, "equipped": equipped})
 
 
 # ============================================================
@@ -1936,11 +1796,6 @@ async def start_web_server():
     app.router.add_post("/api/create", api_create)
     app.router.add_post("/api/leave",  api_leave)
     app.router.add_post("/api/delete", api_delete)
-
-    app.router.add_post("/api/acc/list",     api_acc_list)
-    app.router.add_post("/api/acc/buy",      api_acc_buy)
-    app.router.add_post("/api/acc/equip",    api_acc_equip)
-    app.router.add_post("/api/acc/unequip",  api_acc_unequip)
 
     runner = web.AppRunner(app)
     await runner.setup()
