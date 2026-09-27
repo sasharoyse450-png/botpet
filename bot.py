@@ -103,14 +103,6 @@ async def many(q):
         log.warning("many(): %s", e); return []
 
 
-async def one_two(q1, q2):
-    """Параллельно два запроса .limit(1)."""
-    r1, r2 = await asyncio.gather(q1.limit(1).execute(), q2.limit(1).execute(), return_exceptions=True)
-    d1 = getattr(r1, "data", None) or [] if not isinstance(r1, Exception) else []
-    d2 = getattr(r2, "data", None) or [] if not isinstance(r2, Exception) else []
-    return (d1[0] if d1 else None), (d2[0] if d2 else None)
-
-
 async def my_pets(uid, alive_only=False):
     q = sb.table("pets").select("*").eq("owner_id", uid)
     if alive_only: q = q.eq("dead", False)
@@ -1358,9 +1350,6 @@ async def _log_event_bg(pet_id, user_id, first_name, action):
 
 
 async def api_open(request: web.Request):
-    """Один эндпоинт для открытия питомца: параллельно читает pet+me,
-    при необходимости создаёт member, применяет tick и пишет БД.
-    """
     user = get_user_from_request(request)
     if not user: return json_error("unauthorized", 401)
     try: body = await request.json()
@@ -1368,7 +1357,6 @@ async def api_open(request: web.Request):
     pet_id = body.get("pet_id")
     if not pet_id: return json_error("pet_id required")
 
-    # 1. Параллельно: pet + member
     pet_task = sb.table("pets").select("*").eq("id", pet_id).limit(1).execute()
     mem_task = sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]).limit(1).execute()
     r_pet, r_mem = await asyncio.gather(pet_task, mem_task, return_exceptions=True)
@@ -1377,7 +1365,6 @@ async def api_open(request: web.Request):
 
     if not pet: return json_error("pet not found", 404)
 
-    # 2. Если я не member — создаю (это часть "join")
     joined = False
     if not mem:
         try:
@@ -1392,7 +1379,6 @@ async def api_open(request: web.Request):
         except Exception as e:
             log.warning("member insert: %s", e)
 
-    # 3. Tick (если нужен) — точечно пишем в БД
     if not pet.get("dead"):
         ticked = apply_pet_tick(pet)
         if ticked.get("last_tick_at") != pet.get("last_tick_at") or ticked.get("dead"):
@@ -1419,7 +1405,6 @@ async def api_action(request: web.Request):
     if not pet_id or action not in PET_ACTIONS:
         return json_error("invalid params")
 
-    # 1. Параллельно: pet + me
     pet_task = sb.table("pets").select("*").eq("id", pet_id).limit(1).execute()
     mem_task = sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]).limit(1).execute()
     r_pet, r_mem = await asyncio.gather(pet_task, mem_task, return_exceptions=True)
@@ -1432,7 +1417,6 @@ async def api_action(request: web.Request):
 
     cfg = PET_ACTIONS[action]
 
-    # 2. Проверка кулдауна
     last_key = "last_" + action + "_at"
     ls = mem.get(last_key)
     if ls:
@@ -1447,10 +1431,8 @@ async def api_action(request: web.Request):
     if cfg.get("cost") and score < cfg["cost"]:
         return json_error(f"need {cfg['cost']} score", 400)
 
-    # 3. Применяем tick в памяти (БЕЗ записи), потом эффект
     ticked = apply_pet_tick(pet)
     if ticked.get("dead"):
-        # пишем только смерть
         await sb.table("pets").update({
             "hunger": ticked["hunger"], "mood": ticked["mood"],
             "energy": ticked["energy"], "clean": ticked["clean"],
@@ -1478,16 +1460,16 @@ async def api_action(request: web.Request):
         m_upd["today_score"] = max(cfg["score"], 0)
         m_upd["today_date"] = today_iso
 
-    # 4. Параллельно пишем оба — и сразу получаем обновлённые строки
     p_upd = {
         "hunger": new_pet["hunger"], "mood": new_pet["mood"],
         "energy": new_pet["energy"], "clean": new_pet["clean"],
         "health": new_pet["health"], "xp": new_pet["xp"],
         "last_tick_at": new_pet["last_tick_at"],
     }
+
     r1, r2 = await asyncio.gather(
-        sb.table("pets").update(p_upd).eq("id", pet_id).select().execute(),
-        sb.table("members").update(m_upd).eq("pet_id", pet_id).eq("user_id", user["id"]).select().execute(),
+        sb.table("pets").update(p_upd).eq("id", pet_id).execute(),
+        sb.table("members").update(m_upd).eq("pet_id", pet_id).eq("user_id", user["id"]).execute(),
         return_exceptions=True,
     )
     pet_updated = (getattr(r1, "data", None) or [None])[0] if not isinstance(r1, Exception) else None
@@ -1497,7 +1479,6 @@ async def api_action(request: web.Request):
     if not mem_updated:
         mem_updated = {**mem, **m_upd}
 
-    # 5. Лента — в фоне, не ждём
     asyncio.create_task(_log_event_bg(
         pet_id, user["id"], user.get("first_name") or "Гость", action
     ))
@@ -1551,8 +1532,8 @@ async def api_daily(request: web.Request):
     new_score = (mem.get("score") or 0) + DAILY_BONUS
     upd = {"score": new_score, "last_daily_at": now, "streak": streak}
     r = await sb.table("members").update(upd)\
-          .eq("pet_id", pet_id).eq("user_id", user["id"]).select().execute()
-    mem_updated = (r.data or [None])[0] if not isinstance(r, Exception) else None
+          .eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
+    mem_updated = (getattr(r, "data", None) or [None])[0] if not isinstance(r, Exception) else None
     if not mem_updated: mem_updated = {**mem, **upd}
     return web.json_response({
         "ok": True, "score": new_score, "streak": streak,
@@ -1630,7 +1611,6 @@ async def api_revive(request: web.Request):
 async def api_create(request: web.Request):
     user = get_user_from_request(request)
     if not user: return json_error("unauthorized", 401)
-    # Параллельно: мои питомцы + count живых
     existing_task = sb.table("pets").select("id").eq("owner_id", user["id"]).eq("dead", False).limit(1).execute()
     count_task = sb.table("pets").select("id").eq("dead", False).execute()
     r1, r2 = await asyncio.gather(existing_task, count_task, return_exceptions=True)
@@ -1683,7 +1663,6 @@ async def api_delete(request: web.Request):
     if not pet: return json_error("not found", 404)
     if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
     if confirm_name.strip() != pet["name"]: return json_error("name mismatch", 400)
-    # параллельная очистка связанных
     cleanup_tasks = [
         sb.table(t).delete().eq("pet_id", pet_id).execute()
         for t in ["events","members","invoices","cheques","payouts","platform_fees"]
@@ -1735,7 +1714,7 @@ async def start_web_server():
     app.router.add_get("/health", health)
     app.router.add_post("/webhook/xrocket", xrocket_webhook)
 
-    app.router.add_post("/api/open",   api_open)     # ← новый единый
+    app.router.add_post("/api/open",   api_open)
     app.router.add_post("/api/tick",   api_tick)
     app.router.add_post("/api/action", api_action)
     app.router.add_post("/api/daily",  api_daily)
