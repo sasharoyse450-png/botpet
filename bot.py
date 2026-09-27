@@ -179,11 +179,12 @@ def json_error(msg: str, status: int = 400):
 
 
 # ============================================================
-# CORS
+# CORS + логирование времени
 # ============================================================
 
 @web.middleware
 async def cors_middleware(request, handler):
+    _t0 = time.time()
     origin = request.headers.get("Origin", "")
     if request.method == "OPTIONS":
         response = web.Response(status=204)
@@ -201,6 +202,9 @@ async def cors_middleware(request, handler):
     response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     response.headers["Access-Control-Max-Age"] = "3600"
+    if request.path.startswith("/api/"):
+        dt_ms = (time.time() - _t0) * 1000
+        log.info("⏱ %s %s — %.0f ms", request.method, request.path, dt_ms)
     return response
 
 
@@ -1339,7 +1343,6 @@ async def cmd_help(m: Message):
 # ============================================================
 
 async def _log_event_bg(pet_id, user_id, first_name, action):
-    """Fire-and-forget: пишет событие, ошибки глотает."""
     try:
         await sb.table("events").insert({
             "pet_id": pet_id, "user_id": user_id,
