@@ -1,8 +1,13 @@
 import os
+import json
+import time
+import hmac
+import hashlib
 import random
 import asyncio
 import logging
 from datetime import date, datetime, timezone
+from urllib.parse import parse_qsl
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -33,10 +38,20 @@ XROCKET_TOKEN = os.environ["XROCKET_TOKEN"]
 XROCKET_API   = os.environ.get("XROCKET_API", "https://pay.api.xrocket.exchange")
 PORT          = int(os.environ.get("PORT", 8080))
 
+# CORS: откуда фронт имеет право стучаться в /api/*
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS",
+    "https://sasharoyse450-png.github.io"
+).split(",")
+
 ADMIN_IDS = {8130244626}
 MIN_CHEQUE = 0.01
 PLATFORM_FEE_PCT = 0.05
 GLOBAL_PET_LIMIT = 100
+MAX_LEVEL = 30
+XP_PER_LEVEL = 50
+DAILY_BONUS = 20
+SKIN_PRICE = 50
 SKINS = ["classic", "cat", "dragon", "space", "dino"]
 
 bot = Bot(token=BOT_TOKEN)
@@ -104,7 +119,6 @@ async def count_alive_pets():
 
 
 async def resolve_pet(message: Message, args: list):
-    """Если args[0] — UUID, берёт по ID; иначе — если один питомец, берёт его, если >1 — просит уточнить."""
     if args and is_uuid(args[0].strip()):
         pid = args[0].strip()
         pet = await one(sb.table("pets").select("*").eq("id", pid))
@@ -128,7 +142,79 @@ async def resolve_pet(message: Message, args: list):
     return pets[0], args
 
 
-# ============ xRocket ============
+# ============================================================
+# ПРОВЕРКА Telegram initData (HMAC)
+# ============================================================
+
+def verify_init_data(init_data: str) -> dict | None:
+    """Проверяет подпись initData и возвращает user-dict или None."""
+    if not init_data:
+        return None
+    try:
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+    except Exception:
+        return None
+    received_hash = pairs.pop("hash", None)
+    if not received_hash:
+        return None
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc_hash, received_hash):
+        return None
+    try:
+        auth_date = int(pairs.get("auth_date", "0"))
+    except Exception:
+        return None
+    if abs(time.time() - auth_date) > 48 * 3600:
+        return None
+    try:
+        user = json.loads(pairs.get("user", "{}"))
+    except Exception:
+        return None
+    if not user or not user.get("id"):
+        return None
+    return user
+
+
+def get_user_from_request(request: web.Request) -> dict | None:
+    init_data = request.headers.get("X-Telegram-Init-Data", "")
+    return verify_init_data(init_data)
+
+
+def json_error(msg: str, status: int = 400):
+    return web.json_response({"ok": False, "error": msg}, status=status)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
+@web.middleware
+async def cors_middleware(request, handler):
+    origin = request.headers.get("Origin", "")
+    if request.method == "OPTIONS":
+        response = web.Response(status=204)
+    else:
+        try:
+            response = await handler(request)
+        except web.HTTPException as ex:
+            response = ex
+        except Exception as e:
+            log.exception("handler error: %s", e)
+            response = web.json_response({"ok": False, "error": str(e)}, status=500)
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Telegram-Init-Data"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Max-Age"] = "3600"
+    return response
+
+
+# ============================================================
+# xRocket
+# ============================================================
 
 async def xrocket_request(method, path, json=None):
     url = f"{XROCKET_API}{path}"
@@ -154,9 +240,6 @@ async def create_invoice(amount, currency, description):
 
 
 async def get_invoice_status(iid):
-    """Получить информацию об инвойсе по его ID.
-    Актуальный эндпоинт: GET /api/v1/invoice?invoiceId={id}
-    """
     return await xrocket_request("GET", f"/api/v1/invoice?invoiceId={iid}")
 
 
@@ -206,7 +289,9 @@ def xrocket_error_text(e):
     return f"⚠️ xRocket {getattr(e,'status','?')}: {title or detail}"
 
 
-# ============ /start ============
+# ============================================================
+# /start
+# ============================================================
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
@@ -284,7 +369,9 @@ async def cmd_start(message: Message):
             [InlineKeyboardButton(text="📋 Мои питомцы", callback_data="my_pets")]]))
 
 
-# ============ проверка оплаты ============
+# ============================================================
+# проверка оплаты
+# ============================================================
 
 @dp.callback_query(F.data.startswith("check_"))
 async def cb_check_payment(call: CallbackQuery):
@@ -329,7 +416,9 @@ async def cb_check_payment(call: CallbackQuery):
     await call.answer(f"Статус: {status or 'неизвестно'}", show_alert=True)
 
 
-# ============ смерть питомцев ============
+# ============================================================
+# тики и смерть
+# ============================================================
 
 def _stage_idx(level):
     return 7 if level>=28 else 6 if level>=24 else 5 if level>=20 else 4 if level>=16 \
@@ -421,7 +510,9 @@ async def death_watch_loop():
         await asyncio.sleep(30 * 60)
 
 
-# ============ /pet ============
+# ============================================================
+# /pet
+# ============================================================
 
 PET_ACTIONS = {
     "feed": {"emoji":"🍖","label":"Покормил","cd": 5*60, "xp": 2,
@@ -643,7 +734,9 @@ async def cmd_pet(message: Message):
     await message.answer(text, parse_mode="HTML")
 
 
-# ============ /balance ============
+# ============================================================
+# /balance, /topup, /salary
+# ============================================================
 
 @dp.message(Command("balance"))
 async def cmd_balance(m: Message):
@@ -655,8 +748,6 @@ async def cmd_balance(m: Message):
         lines.append(f"• <b>{p['name']}</b>{dead} — <b>{float(p.get('bank_balance') or 0):.4f} USDT</b>\n  <code>{p['id']}</code>")
     await m.answer("\n".join(lines), parse_mode="HTML")
 
-
-# ============ /topup [pet_id] 1 ============
 
 @dp.message(Command("topup"))
 async def cmd_topup(m: Message):
@@ -695,14 +786,11 @@ async def cmd_topup(m: Message):
         parse_mode="HTML", reply_markup=kb)
 
 
-# ============ /salary [pet_id] 1 3 ============
-
 @dp.message(Command("salary"))
 async def cmd_salary(m: Message):
     args = m.text.split()[1:]
     pet, rest = await resolve_pet(m, args)
     if not pet: return
-
     amount = None; top_n = None
     if len(rest) >= 1:
         try: amount = float(rest[0].replace(",","."))
@@ -710,7 +798,6 @@ async def cmd_salary(m: Message):
     if len(rest) >= 2:
         try: top_n = int(rest[1])
         except: await m.answer("Формат: /salary [pet_id] 1 3"); return
-
     await run_salary_pet(pet["id"], m.from_user.id, amount, top_n, m)
 
 
@@ -802,7 +889,9 @@ async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
     await message.answer(text, parse_mode="HTML")
 
 
-# ============ АДМИНКА ============
+# ============================================================
+# АДМИНКА (без изменений)
+# ============================================================
 
 @dp.message(Command("admin"))
 async def cmd_admin(m: Message):
@@ -1144,7 +1233,6 @@ async def cmd_cancel_cheques(m: Message):
     args = m.text.split()[1:]
     pet, _ = await resolve_pet(m, args)
     if not pet: return
-
     xr = await list_xrocket_cheques()
     db = await many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
     ids = {}
@@ -1186,7 +1274,9 @@ async def cmd_xr(m: Message):
     await m.answer("\n".join(lines), parse_mode="HTML")
 
 
-# ============ create / my_pets ============
+# ============================================================
+# create / my_pets (callback)
+# ============================================================
 
 @dp.callback_query(F.data == "create")
 async def cb_create(call: CallbackQuery):
@@ -1197,7 +1287,6 @@ async def cb_create(call: CallbackQuery):
     total = await count_alive_pets()
     if total >= GLOBAL_PET_LIMIT:
         await call.answer(f"Все {GLOBAL_PET_LIMIT} питомцев заняты", show_alert=True); return
-
     pet = None
     for _ in range(5):
         code = gen_code()
@@ -1207,7 +1296,6 @@ async def cb_create(call: CallbackQuery):
         except Exception as e:
             if "23505" not in str(e): break
     if not pet: await call.answer("Ошибка.", show_alert=True); return
-
     await sb.table("members").insert({
         "pet_id": pet["id"], "user_id": user.id,
         "first_name": user.first_name or "Гость", "username": user.username,
@@ -1258,7 +1346,279 @@ async def cmd_help(m: Message):
         parse_mode="HTML")
 
 
-# ============ health + webhook ============
+# ============================================================
+# API ДЛЯ ФРОНТА (initData HMAC)
+# ============================================================
+
+async def api_tick(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    if not pet_id: return json_error("pet_id required")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("pet not found", 404)
+    if not pet.get("dead"):
+        pet = await save_pet_tick(pet)
+    return web.json_response({"ok": True, "pet": pet})
+
+
+async def api_join(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    if not pet_id: return json_error("pet_id required")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("pet not found", 404)
+    existing = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
+    if existing:
+        return web.json_response({"ok": True, "me": existing, "pet": pet, "joined": False})
+    res = await sb.table("members").insert({
+        "pet_id": pet_id, "user_id": user["id"],
+        "username": user.get("username"),
+        "first_name": user.get("first_name") or "Гость",
+        "score": 0,
+    }).execute()
+    me = res.data[0] if res.data else None
+    return web.json_response({"ok": True, "me": me, "pet": pet, "joined": True})
+
+
+async def api_action(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    action = body.get("action")
+    if not pet_id or action not in PET_ACTIONS:
+        return json_error("invalid params")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("pet not found", 404)
+    if pet.get("dead"): return json_error("pet is dead", 400)
+    pet = await save_pet_tick(pet)
+    if pet.get("dead"): return json_error("pet died during tick", 400)
+
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
+    if not mem: return json_error("not a member", 403)
+
+    cfg = PET_ACTIONS[action]
+    last_key = "last_" + action + "_at"
+    ls = mem.get(last_key)
+    if ls:
+        try:
+            last_dt = datetime.fromisoformat(ls.replace("Z", "+00:00"))
+            left = cfg["cd"] - (datetime.now(timezone.utc) - last_dt).total_seconds()
+            if left > 0:
+                return json_error(f"cooldown {int(left)}s", 429)
+        except: pass
+
+    score = mem.get("score") or 0
+    if cfg.get("cost") and score < cfg["cost"]:
+        return json_error(f"need {cfg['cost']} score", 400)
+
+    new_pet = dict(pet)
+    for k, v in cfg["effects"].items():
+        new_pet[k] = max(0, min(100, (new_pet.get(k) or 0) + v))
+    new_pet["xp"] = (pet.get("xp") or 0) + cfg["xp"]
+    old_st = _stage_idx(min(30, (pet.get("xp") or 0) // 50 + 1))
+    new_st = _stage_idx(min(30, new_pet["xp"] // 50 + 1))
+
+    await sb.table("pets").update({
+        "hunger": new_pet["hunger"], "mood": new_pet["mood"],
+        "energy": new_pet["energy"], "clean": new_pet["clean"],
+        "health": new_pet["health"], "xp": new_pet["xp"],
+        "last_tick_at": new_pet["last_tick_at"],
+    }).eq("id", pet_id).execute()
+
+    iso_now = datetime.now(timezone.utc).isoformat()
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    new_score = score + cfg["score"]
+    m_upd = {"score": new_score, last_key: iso_now}
+    if mem.get("today_date") == today_iso:
+        m_upd["today_score"] = (mem.get("today_score") or 0) + max(cfg["score"], 0)
+    else:
+        m_upd["today_score"] = max(cfg["score"], 0)
+        m_upd["today_date"] = today_iso
+    await sb.table("members").update(m_upd).eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
+
+    try:
+        await sb.table("events").insert({
+            "pet_id": pet_id, "user_id": user["id"],
+            "first_name": user.get("first_name") or "Гость",
+            "action": action,
+        }).execute()
+    except: pass
+
+    pet_updated = await one(sb.table("pets").select("*").eq("id", pet_id))
+    mem_updated = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
+    return web.json_response({
+        "ok": True,
+        "pet": pet_updated,
+        "me": mem_updated,
+        "evolved": new_st > old_st,
+    })
+
+
+async def api_daily(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    if not pet_id: return json_error("pet_id required")
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
+    if not mem: return json_error("not a member", 403)
+    last = mem.get("last_daily_at")
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - last_dt).total_seconds() < 24 * 3600:
+                return json_error("already claimed", 429)
+        except: pass
+    streak = 1
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if (datetime.now(timezone.utc) - last_dt).total_seconds() < 2 * 24 * 3600:
+                streak = (mem.get("streak") or 0) + 1
+        except: pass
+    now = datetime.now(timezone.utc).isoformat()
+    new_score = (mem.get("score") or 0) + DAILY_BONUS
+    await sb.table("members").update({
+        "score": new_score, "last_daily_at": now, "streak": streak,
+    }).eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
+    return web.json_response({"ok": True, "score": new_score, "streak": streak, "bonus": DAILY_BONUS})
+
+
+async def api_rename(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    name = (body.get("name") or "").strip()[:20]
+    if not pet_id or not name: return json_error("invalid params")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
+    await sb.table("pets").update({"name": name}).eq("id", pet_id).execute()
+    return web.json_response({"ok": True, "name": name})
+
+
+async def api_skin(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    new_skin = body.get("skin")
+    if not pet_id or new_skin not in SKINS: return json_error("invalid params")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
+    if pet.get("skin") == new_skin: return json_error("already this skin", 400)
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
+    if not mem: return json_error("not a member", 403)
+    score = mem.get("score") or 0
+    if score < SKIN_PRICE: return json_error(f"need {SKIN_PRICE} score", 400)
+    await sb.table("pets").update({"skin": new_skin}).eq("id", pet_id).execute()
+    new_score = score - SKIN_PRICE
+    await sb.table("members").update({"score": new_score}).eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
+    return web.json_response({"ok": True, "skin": new_skin, "score": new_score})
+
+
+async def api_revive(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    if not pet_id: return json_error("pet_id required")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
+    if not pet.get("dead"): return json_error("pet is alive", 400)
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet_id).eq("user_id", user["id"]))
+    if not mem: return json_error("not a member", 403)
+    score = mem.get("score") or 0
+    if score < 100: return json_error("need 100 score", 400)
+    now = datetime.now(timezone.utc).isoformat()
+    await sb.table("pets").update({
+        "dead": False, "dead_at": None,
+        "health": 50, "hunger": 50, "mood": 50, "clean": 50, "energy": 50,
+        "last_tick_at": now,
+    }).eq("id", pet_id).execute()
+    new_score = score - 100
+    await sb.table("members").update({"score": new_score}).eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
+    return web.json_response({"ok": True})
+
+
+async def api_create(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    existing = await my_pets(user["id"], alive_only=True)
+    if existing: return json_error("already have pet", 400)
+    total = await count_alive_pets()
+    if total >= GLOBAL_PET_LIMIT: return json_error("limit reached", 400)
+    pet = None
+    for _ in range(5):
+        code = gen_code()
+        try:
+            r = await sb.table("pets").insert({"owner_id": user["id"], "invite_code": code}).execute()
+            if r.data: pet = r.data[0]; break
+        except Exception as e:
+            if "23505" not in str(e): break
+    if not pet: return json_error("create failed", 500)
+    await sb.table("members").insert({
+        "pet_id": pet["id"], "user_id": user["id"],
+        "first_name": user.get("first_name") or "Гость",
+        "username": user.get("username"),
+        "score": 0,
+    }).execute()
+    return web.json_response({"ok": True, "pet": pet})
+
+
+async def api_leave(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    if not pet_id: return json_error("pet_id required")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    if pet["owner_id"] == user["id"]: return json_error("owner cannot leave", 400)
+    await sb.table("members").delete().eq("pet_id", pet_id).eq("user_id", user["id"]).execute()
+    return web.json_response({"ok": True})
+
+
+async def api_delete(request: web.Request):
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    confirm_name = body.get("confirm_name")
+    if not pet_id or not confirm_name: return json_error("invalid params")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
+    if confirm_name.strip() != pet["name"]: return json_error("name mismatch", 400)
+    for table in ["events","members","invoices","cheques","payouts","platform_fees"]:
+        try:
+            await sb.table(table).delete().eq("pet_id", pet_id).execute()
+        except Exception as e:
+            log.warning(f"cleanup {table}: {e}")
+    await sb.table("pets").delete().eq("id", pet_id).execute()
+    return web.json_response({"ok": True})
+
+
+# ============================================================
+# health + webhook + запуск
+# ============================================================
 
 async def health(request: web.Request):
     return web.json_response({"ok": True, "service": "pet-bot"})
@@ -1292,18 +1652,28 @@ async def xrocket_webhook(request: web.Request):
     return web.json_response({"ok": True})
 
 
-# ============ запуск ============
-
 async def start_web_server():
-    app = web.Application()
+    app = web.Application(middlewares=[cors_middleware])
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
     app.router.add_post("/webhook/xrocket", xrocket_webhook)
+
+    app.router.add_post("/api/tick",   api_tick)
+    app.router.add_post("/api/join",   api_join)
+    app.router.add_post("/api/action", api_action)
+    app.router.add_post("/api/daily",  api_daily)
+    app.router.add_post("/api/rename", api_rename)
+    app.router.add_post("/api/skin",   api_skin)
+    app.router.add_post("/api/revive", api_revive)
+    app.router.add_post("/api/create", api_create)
+    app.router.add_post("/api/leave",  api_leave)
+    app.router.add_post("/api/delete", api_delete)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Web server on :%s", PORT)
+    log.info("Web server on :%s (API + CORS ready)", PORT)
 
 
 async def main():
