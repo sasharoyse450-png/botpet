@@ -14,7 +14,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
-    WebAppInfo
+    WebAppInfo, PreCheckoutQuery, LabeledPrice,
 )
 from supabase import create_async_client, AsyncClient
 from aiohttp import web
@@ -51,7 +51,36 @@ MAX_LEVEL = 30
 XP_PER_LEVEL = 50
 DAILY_BONUS = 20
 SKIN_PRICE = 50
-SKINS = ["classic", "cat", "dragon", "space", "dino"]
+SKINS = ["classic", "cat", "space", "dino"]
+
+# ============================================================
+# АКСЕССУАРЫ — стоимость 1 Star
+# ============================================================
+ACCESSORY_PRICE_STARS = 1
+
+ACCESSORIES = {
+    # слот head
+    "crown":      {"emoji": "👑", "slot": "head", "name": "Корона"},
+    "tophat":     {"emoji": "🎩", "slot": "head", "name": "Цилиндр"},
+    "cap":        {"emoji": "🧢", "slot": "head", "name": "Кепка"},
+    "grad":       {"emoji": "🎓", "slot": "head", "name": "Выпускник"},
+    "sunhat":     {"emoji": "👒", "slot": "head", "name": "Шляпка"},
+    "helmet":     {"emoji": "⛑",  "slot": "head", "name": "Каска"},
+    "pumpkin":    {"emoji": "🎃", "slot": "head", "name": "Тыква"},
+    "party":      {"emoji": "🎉", "slot": "head", "name": "Хлопушка"},
+    # слот eyes
+    "sunglasses": {"emoji": "🕶",  "slot": "eyes", "name": "Тёмные очки"},
+    "nerd":       {"emoji": "👓", "slot": "eyes", "name": "Очки"},
+    "goggles":    {"emoji": "🥽", "slot": "eyes", "name": "Маска"},
+    # слот neck
+    "bow":        {"emoji": "🎀", "slot": "neck", "name": "Бантик"},
+    "scarf":      {"emoji": "🧣", "slot": "neck", "name": "Шарф"},
+    "medal":      {"emoji": "🏅", "slot": "neck", "name": "Медаль"},
+    "beads":      {"emoji": "📿", "slot": "neck", "name": "Бусы"},
+    "ribbon":     {"emoji": "🎗",  "slot": "neck", "name": "Ленточка"},
+}
+
+def accessory_slot(acc_id): return (ACCESSORIES.get(acc_id) or {}).get("slot")
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
@@ -179,7 +208,7 @@ def json_error(msg: str, status: int = 400):
 
 
 # ============================================================
-# CORS + логирование времени
+# CORS
 # ============================================================
 
 @web.middleware
@@ -409,6 +438,65 @@ async def cb_check_payment(call: CallbackQuery):
 
 
 # ============================================================
+# TELEGRAM STARS — покупка аксессуаров
+# ============================================================
+
+@dp.pre_checkout_query()
+async def on_pre_checkout(q: PreCheckoutQuery):
+    """Подтверждаем — обязаны ответить в течение 10 секунд."""
+    try:
+        await q.answer(ok=True)
+    except Exception as e:
+        log.warning("pre_checkout answer: %s", e)
+
+
+@dp.message(F.successful_payment)
+async def on_successful_payment(m: Message):
+    """Пришла оплата Stars — выдаём аксессуар."""
+    sp = m.successful_payment
+    payload = sp.invoice_payload or ""
+    log.info("💫 Успешная оплата: %s (charge=%s, stars=%s)",
+             payload, sp.telegram_payment_charge_id, sp.total_amount)
+
+    if not payload.startswith("buy_acc|"):
+        return
+
+    try:
+        _, pet_id, acc_id = payload.split("|", 2)
+    except Exception:
+        log.warning("bad payload: %s", payload); return
+
+    acc = ACCESSORIES.get(acc_id)
+    if not acc:
+        log.warning("unknown accessory: %s", acc_id); return
+
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet:
+        log.warning("pet not found: %s", pet_id); return
+
+    owned = list(pet.get("accessories_owned") or [])
+    if acc_id not in owned:
+        owned.append(acc_id)
+
+    equipped = dict(pet.get("accessories_equipped") or {})
+    equipped[acc["slot"]] = acc_id  # автонадеваем поверх того, что было в слоте
+
+    await sb.table("pets").update({
+        "accessories_owned": owned,
+        "accessories_equipped": equipped,
+    }).eq("id", pet_id).execute()
+
+    try:
+        await m.answer(
+            f"✨ <b>{acc['name']}</b> — куплен и надет!\n"
+            f"{pet_line(pet)}\n\n"
+            f"Открой приложение, чтобы увидеть.",
+            parse_mode="HTML")
+    except Exception:
+        pass
+
+
+# ============================================================
 # тики
 # ============================================================
 
@@ -531,8 +619,7 @@ PET_ALIASES = {
 
 PET_STAGE_NAMES = {
     "classic": ["Яйцо","Птенец","Юнец","Подросток","Взрослый","Опытный","Старейшина","Легенда"],
-    "cat":     ["Яйцо","Котёнок","Котик","Подросший кот","Крупный кот","Хищник","Царь зверей","Тигр"],
-    "dragon":  ["Яйцо","Ящерка","Дракончик","Юный дракон","Дракон","Взрослый дракон","Древний дракон","Огненный владыка"],
+    "cat":     ["Яйцо","Котёнок","Котик","Чёрный кот","Леопард","Тигр","Лев","Царь зверей"],
     "space":   ["Туманность","Луна","Звезда","Яркая звезда","Созвездие","Комета","Сверхновая","Солнце"],
     "dino":    ["Яйцо","Ящерка","Динозаврик","Юный дино","Ящер","Хищный дино","Древний ящер","Вулкан"],
 }
@@ -908,7 +995,10 @@ async def cmd_admin(m: Message):
         "/setbal [pet_id] 5\n"
         "/addbal [pet_id] 1\n\n"
         "<b>Скин:</b>\n"
-        "/setskin [pet_id] classic|cat|dragon|space|dino\n\n"
+        "/setskin [pet_id] classic|cat|space|dino\n\n"
+        "<b>Аксессуары:</b>\n"
+        "/giveacc [pet_id] crown — выдать бесплатно\n"
+        "/clearacc [pet_id] — снять всё\n\n"
         "<b>Смерть:</b>\n"
         "/revive [pet_id] · /kill [pet_id]\n\n"
         "<b>Прочее:</b>\n"
@@ -918,6 +1008,42 @@ async def cmd_admin(m: Message):
         "/reset_scores\n"
         "/xr — xRocket",
         parse_mode="HTML")
+
+
+@dp.message(Command("giveacc"))
+async def cmd_giveacc(m: Message):
+    if not is_admin(m.from_user.id): return
+    args = m.text.split()[1:]
+    pet, rest = await resolve_pet(m, args)
+    if not pet: return
+    if not rest:
+        accs = "\n".join(f"• <code>{k}</code> — {v['emoji']} {v['name']} ({v['slot']})"
+                         for k, v in ACCESSORIES.items())
+        await m.answer(f"Формат: /giveacc [pet_id] crown\n\n<b>Доступные:</b>\n{accs}", parse_mode="HTML"); return
+    acc_id = rest[0].strip().lower()
+    acc = ACCESSORIES.get(acc_id)
+    if not acc:
+        await m.answer(f"Нет такого аксессуара: <code>{acc_id}</code>"); return
+    owned = list(pet.get("accessories_owned") or [])
+    if acc_id not in owned: owned.append(acc_id)
+    equipped = dict(pet.get("accessories_equipped") or {})
+    equipped[acc["slot"]] = acc_id
+    await sb.table("pets").update({
+        "accessories_owned": owned, "accessories_equipped": equipped,
+    }).eq("id", pet["id"]).execute()
+    await m.answer(f"✅ Выдан {acc['emoji']} <b>{acc['name']}</b>\n{pet_line(pet)}", parse_mode="HTML")
+
+
+@dp.message(Command("clearacc"))
+async def cmd_clearacc(m: Message):
+    if not is_admin(m.from_user.id): return
+    args = m.text.split()[1:]
+    pet, _ = await resolve_pet(m, args)
+    if not pet: return
+    await sb.table("pets").update({
+        "accessories_owned": [], "accessories_equipped": {},
+    }).eq("id", pet["id"]).execute()
+    await m.answer(f"✅ Аксессуары сняты\n{pet_line(pet)}", parse_mode="HTML")
 
 
 @dp.message(Command("fees"))
@@ -1267,7 +1393,7 @@ async def cmd_xr(m: Message):
 
 
 # ============================================================
-# create / my_pets
+# create / my_pets (callbacks)
 # ============================================================
 
 @dp.callback_query(F.data == "create")
@@ -1339,7 +1465,7 @@ async def cmd_help(m: Message):
 
 
 # ============================================================
-# ОПТИМИЗИРОВАННЫЙ API ДЛЯ ФРОНТА
+# API ДЛЯ ФРОНТА
 # ============================================================
 
 async def _log_event_bg(pet_id, user_id, first_name, action):
@@ -1477,35 +1603,17 @@ async def api_action(request: web.Request):
     )
     pet_updated = (getattr(r1, "data", None) or [None])[0] if not isinstance(r1, Exception) else None
     mem_updated = (getattr(r2, "data", None) or [None])[0] if not isinstance(r2, Exception) else None
-    if not pet_updated:
-        pet_updated = {**pet, **p_upd}
-    if not mem_updated:
-        mem_updated = {**mem, **m_upd}
+    if not pet_updated: pet_updated = {**pet, **p_upd}
+    if not mem_updated: mem_updated = {**mem, **m_upd}
 
     asyncio.create_task(_log_event_bg(
         pet_id, user["id"], user.get("first_name") or "Гость", action
     ))
 
     return web.json_response({
-        "ok": True,
-        "pet": pet_updated,
-        "me": mem_updated,
+        "ok": True, "pet": pet_updated, "me": mem_updated,
         "evolved": new_st > old_st,
     })
-
-
-async def api_tick(request: web.Request):
-    user = get_user_from_request(request)
-    if not user: return json_error("unauthorized", 401)
-    try: body = await request.json()
-    except: return json_error("bad json")
-    pet_id = body.get("pet_id")
-    if not pet_id: return json_error("pet_id required")
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet: return json_error("pet not found", 404)
-    if not pet.get("dead"):
-        pet = await save_pet_tick(pet)
-    return web.json_response({"ok": True, "pet": pet})
 
 
 async def api_daily(request: web.Request):
@@ -1676,6 +1784,107 @@ async def api_delete(request: web.Request):
 
 
 # ============================================================
+# АКСЕССУАРЫ — API
+# ============================================================
+
+async def api_acc_list(request: web.Request):
+    """Список всех аксессуаров + что куплено/надето у питомца."""
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    if not pet_id: return json_error("pet_id required")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    items = []
+    for acc_id, acc in ACCESSORIES.items():
+        items.append({
+            "id": acc_id, "emoji": acc["emoji"], "slot": acc["slot"],
+            "name": acc["name"], "price": ACCESSORY_PRICE_STARS,
+        })
+    return web.json_response({
+        "ok": True,
+        "items": items,
+        "owned": pet.get("accessories_owned") or [],
+        "equipped": pet.get("accessories_equipped") or {},
+        "is_owner": pet["owner_id"] == user["id"],
+    })
+
+
+async def api_acc_buy(request: web.Request):
+    """Создаёт инвойс в Telegram Stars и возвращает URL для tg.openInvoice."""
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    acc_id = body.get("accessory_id")
+    if not pet_id or not acc_id: return json_error("invalid params")
+    acc = ACCESSORIES.get(acc_id)
+    if not acc: return json_error("unknown accessory", 404)
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
+
+    try:
+        link = await bot.create_invoice_link(
+            title=f"{acc['emoji']} {acc['name']}",
+            description=f"Аксессуар для питомца «{pet['name']}»",
+            payload=f"buy_acc|{pet_id}|{acc_id}",
+            currency="XTR",
+            prices=[LabeledPrice(label=acc["name"], amount=ACCESSORY_PRICE_STARS)],
+        )
+    except Exception as e:
+        log.exception("create_invoice_link")
+        return json_error(f"telegram: {e}", 500)
+    return web.json_response({"ok": True, "invoice_url": link})
+
+
+async def api_acc_equip(request: web.Request):
+    """Надеть купленный аксессуар (без покупки)."""
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    acc_id = body.get("accessory_id")
+    if not pet_id: return json_error("invalid params")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
+    equipped = dict(pet.get("accessories_equipped") or {})
+    if acc_id is None or acc_id == "":
+        return json_error("accessory_id required")
+    acc = ACCESSORIES.get(acc_id)
+    if not acc: return json_error("unknown accessory", 404)
+    owned = pet.get("accessories_owned") or []
+    if acc_id not in owned: return json_error("not owned", 403)
+    equipped[acc["slot"]] = acc_id
+    await sb.table("pets").update({"accessories_equipped": equipped}).eq("id", pet_id).execute()
+    return web.json_response({"ok": True, "equipped": equipped})
+
+
+async def api_acc_unequip(request: web.Request):
+    """Снять аксессуар с указанного слота."""
+    user = get_user_from_request(request)
+    if not user: return json_error("unauthorized", 401)
+    try: body = await request.json()
+    except: return json_error("bad json")
+    pet_id = body.get("pet_id")
+    slot = body.get("slot")
+    if not pet_id or slot not in ("head", "eyes", "neck"):
+        return json_error("invalid params")
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet: return json_error("not found", 404)
+    if pet["owner_id"] != user["id"]: return json_error("not owner", 403)
+    equipped = dict(pet.get("accessories_equipped") or {})
+    equipped.pop(slot, None)
+    await sb.table("pets").update({"accessories_equipped": equipped}).eq("id", pet_id).execute()
+    return web.json_response({"ok": True, "equipped": equipped})
+
+
+# ============================================================
 # health + webhook + запуск
 # ============================================================
 
@@ -1718,7 +1927,6 @@ async def start_web_server():
     app.router.add_post("/webhook/xrocket", xrocket_webhook)
 
     app.router.add_post("/api/open",   api_open)
-    app.router.add_post("/api/tick",   api_tick)
     app.router.add_post("/api/action", api_action)
     app.router.add_post("/api/daily",  api_daily)
     app.router.add_post("/api/rename", api_rename)
@@ -1727,6 +1935,12 @@ async def start_web_server():
     app.router.add_post("/api/create", api_create)
     app.router.add_post("/api/leave",  api_leave)
     app.router.add_post("/api/delete", api_delete)
+
+    # аксессуары
+    app.router.add_post("/api/acc/list",     api_acc_list)
+    app.router.add_post("/api/acc/buy",      api_acc_buy)
+    app.router.add_post("/api/acc/equip",    api_acc_equip)
+    app.router.add_post("/api/acc/unequip",  api_acc_unequip)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -1738,7 +1952,7 @@ async def start_web_server():
 async def main():
     global sb
     sb = await create_async_client(SUPABASE_URL, SUPABASE_KEY)
-    log.info("✅ Async Supabase подключён")
+    log.info("✅ Async Supabase подключен")
 
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
