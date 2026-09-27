@@ -15,7 +15,6 @@ from supabase import create_async_client, AsyncClient
 from aiohttp import web
 import aiohttp
 
-# ---- ЧИСТЫЕ ЛОГИ ----
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -36,11 +35,13 @@ PORT          = int(os.environ.get("PORT", 8080))
 
 ADMIN_IDS = {8130244626}
 MIN_CHEQUE = 0.01
+PLATFORM_FEE_PCT = 0.05
+GLOBAL_PET_LIMIT = 100
 SKINS = ["classic", "cat", "dragon", "space", "dino"]
 
 bot = Bot(token=BOT_TOKEN)
 dp  = Dispatcher()
-sb: AsyncClient = None  # инициализируется в main()
+sb: AsyncClient = None
 CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 
@@ -54,7 +55,8 @@ def escape_html(s): return str(s or "").replace("&","&amp;").replace("<","&lt;")
 def pet_line(p):
     if not p: return "—"
     lvl = min(30, (p.get("xp") or 0) // 50 + 1)
-    return f"🐾 <b>{p.get('name','?')}</b> · ур. {lvl} · <code>{p.get('id')}</code>"
+    dead = " 💀" if p.get("dead") else ""
+    return f"🐾 <b>{p.get('name','?')}</b>{dead} · ур. {lvl} · <code>{p.get('id')}</code>"
 
 
 def pick_link(obj):
@@ -87,31 +89,18 @@ async def many(q):
         log.warning("many(): %s", e); return []
 
 
-async def my_pets(uid):
-    return await many(sb.table("pets").select("*").eq("owner_id", uid))
+async def my_pets(uid, alive_only=False):
+    q = sb.table("pets").select("*").eq("owner_id", uid)
+    if alive_only: q = q.eq("dead", False)
+    return await many(q)
 
 
-async def resolve_pet(message: Message, args: list):
-    if args and is_uuid(args[0].strip()):
-        pid = args[0].strip()
-        pet = await one(sb.table("pets").select("*").eq("id", pid))
-        if not pet:
-            await message.answer(f"❌ Питомец <code>{pid}</code> не найден.", parse_mode="HTML")
-            return None, None
-        return pet, args[1:]
-
-    pets = await my_pets(message.from_user.id)
-    if not pets:
-        await message.answer("❌ У тебя нет питомцев.")
-        return None, None
-    if len(pets) > 1:
-        lines = ["⚠️ У тебя несколько питомцев — укажи <b>ID первым аргументом</b>.\n"]
-        for p in pets:
-            lvl = min(30, (p.get("xp") or 0) // 50 + 1)
-            lines.append(f"• <b>{p['name']}</b> · ур. {lvl}\n  <code>{p['id']}</code>")
-        await message.answer("\n".join(lines), parse_mode="HTML")
-        return None, None
-    return pets[0], args
+async def count_alive_pets():
+    try:
+        r = await sb.table("pets").select("id").eq("dead", False).execute()
+        return len(r.data or [])
+    except Exception as e:
+        log.warning("count_alive: %s", e); return 0
 
 
 # ============ xRocket ============
@@ -238,11 +227,14 @@ async def cmd_start(message: Message):
             "invoice_id": str(iid), "pet_id": pet_id, "owner_id": user.id,
             "amount": amount, "currency": pet.get("currency","USDT"), "status": "pending",
         }).execute()
+        fee = amount * PLATFORM_FEE_PCT
+        net = amount - fee
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"💳 Оплатить {amount}", url=link)],
             [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{iid}")]])
         await message.answer(
-            f"💳 <b>Счёт {amount} USDT</b>\n{pet_line(pet)}\nInvoice: <code>{iid}</code>",
+            f"💳 <b>Счёт {amount} USDT</b>\n{pet_line(pet)}\n"
+            f"<i>В банк: {net:.4f} · комиссия: {fee:.4f}</i>",
             parse_mode="HTML", reply_markup=kb); return
 
     if payload.startswith("salary_"):
@@ -254,21 +246,17 @@ async def cmd_start(message: Message):
 
     await message.answer(
         "👋 Бот общего питомца.\n\n"
-        "Создай питомца — получишь ссылку для друзей.\n\n"
-        "В группе можно управлять питомцем командами:\n"
-        "<code>/pet help</code> — справка по всем командам\n"
-        "<code>/pet имя покормить</code>\n"
-        "<code>/pet имя погладить</code>\n"
-        "<code>/pet имя играть</code>\n"
-        "<code>/pet имя помыть</code>\n"
-        "<code>/pet имя лечить</code>",
+        "Открой приложение — создай питомца или управляй им.\n\n"
+        "В группе доступны команды:\n"
+        "<code>/pet help</code> — справка",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🐣 Создать питомца", callback_data="create")],
+            [InlineKeyboardButton(text="🐾 Открыть приложение",
+                                  web_app=WebAppInfo(url=WEBAPP_URL))],
             [InlineKeyboardButton(text="📋 Мои питомцы", callback_data="my_pets")]]))
 
 
-# ============ проверка оплаты ============
+# ============ проверка оплаты с комиссией ============
 
 @dp.callback_query(F.data.startswith("check_"))
 async def cb_check_payment(call: CallbackQuery):
@@ -287,13 +275,25 @@ async def cb_check_payment(call: CallbackQuery):
     if status in ("paid","success","completed","paid_success"):
         pet = await one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
         if pet:
-            nb = float(pet.get("bank_balance") or 0) + float(inv["amount"])
+            paid_amount = float(inv["amount"])
+            fee = round(paid_amount * PLATFORM_FEE_PCT, 6)
+            net = round(paid_amount - fee, 6)
+            nb = float(pet.get("bank_balance") or 0) + net
             await sb.table("pets").update({"bank_balance": nb}).eq("id", inv["pet_id"]).execute()
             await sb.table("invoices").update({"status": "paid"}).eq("invoice_id", iid).execute()
+            try:
+                await sb.table("platform_fees").insert({
+                    "pet_id": inv["pet_id"], "owner_id": inv["owner_id"],
+                    "amount": fee, "currency": inv.get("currency", "USDT"),
+                    "invoice_id": str(iid),
+                }).execute()
+            except Exception as e:
+                log.warning("fee insert failed: %s", e)
             await call.answer("Оплачено! ✅", show_alert=True)
             try:
                 await call.message.edit_text(
-                    f"✅ <b>Банк пополнен на {inv['amount']} USDT</b>\n"
+                    f"✅ <b>Банк пополнен на {net:.4f} USDT</b>\n"
+                    f"<i>комиссия: {fee:.4f} USDT</i>\n"
                     f"{pet_line(pet)}\nБаланс: <b>{nb:.4f} USDT</b>",
                     parse_mode="HTML")
             except: pass
@@ -301,199 +301,7 @@ async def cb_check_payment(call: CallbackQuery):
     await call.answer(f"Статус: {status or 'неизвестно'}", show_alert=True)
 
 
-# ============ /balance ============
-
-@dp.message(Command("balance"))
-async def cmd_balance(m: Message):
-    pets = await my_pets(m.from_user.id)
-    if not pets:
-        await m.answer("Нет питомцев."); return
-    lines = ["🏦 <b>Балансы:</b>\n"]
-    for p in pets:
-        lines.append(f"• <b>{p['name']}</b> — <b>{float(p.get('bank_balance') or 0):.4f} USDT</b>\n  <code>{p['id']}</code>")
-    await m.answer("\n".join(lines), parse_mode="HTML")
-
-
-# ============ /topup ============
-
-@dp.message(Command("topup"))
-async def cmd_topup(m: Message):
-    user = m.from_user
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-
-    if not rest:
-        await m.answer(f"Формат: /topup [pet_id] 1\n\n{pet_line(pet)}", parse_mode="HTML"); return
-    try: amount = float(rest[0].replace(",","."))
-    except: await m.answer("Не разобрать сумму."); return
-    if amount <= 0 or amount > 1000:
-        await m.answer("0.01 – 1000 USDT"); return
-
-    await m.answer(f"💳 Создаю счёт на {amount} USDT…\n{pet_line(pet)}", parse_mode="HTML")
-    try:
-        inv = await create_invoice(amount, pet.get("currency","USDT"),
-                                   f"Банк «{pet['name']}» ({pet['id'][:8]})")
-    except Exception as e:
-        await m.answer(xrocket_error_text(e)); return
-    link = pick_link(inv); iid = inv.get("id") or inv.get("invoiceId")
-    if not link or not iid:
-        await m.answer("⚠️ Нет ссылки."); return
-    await sb.table("invoices").insert({
-        "invoice_id": str(iid), "pet_id": pet["id"], "owner_id": user.id,
-        "amount": amount, "currency": pet.get("currency","USDT"), "status": "pending",
-    }).execute()
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"💳 Оплатить {amount}", url=link)],
-        [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_{iid}")]])
-    await m.answer(
-        f"💳 <b>Счёт {amount} USDT</b>\n{pet_line(pet)}\nInvoice: <code>{iid}</code>",
-        parse_mode="HTML", reply_markup=kb)
-
-
-# ============ /salary ============
-
-@dp.message(Command("salary"))
-async def cmd_salary(m: Message):
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-
-    amount = None; top_n = None
-    if len(rest) >= 1:
-        try: amount = float(rest[0].replace(",","."))
-        except: await m.answer("Формат: /salary [pet_id] 1 3"); return
-    if len(rest) >= 2:
-        try: top_n = int(rest[1])
-        except: await m.answer("Формат: /salary [pet_id] 1 3"); return
-
-    await run_salary_pet(pet["id"], m.from_user.id, amount, top_n, m)
-
-
-async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
-    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
-    if not pet:
-        await message.answer("Питомец не найден."); return
-    if pet["owner_id"] != owner_id:
-        await message.answer(f"❌ Только владелец.\n{pet_line(pet)}", parse_mode="HTML"); return
-
-    balance = float(pet.get("bank_balance") or 0)
-    if balance <= 0:
-        await message.answer(f"❌ Банк пуст.\n{pet_line(pet)}", parse_mode="HTML"); return
-    if amount is None or amount <= 0: amount = balance
-    if amount > balance:
-        await message.answer(f"В банке только {balance:.4f}."); return
-
-    today = date.today().isoformat()
-    members = await many(sb.table("members").select("*").eq("pet_id", pet["id"]))
-    for m in members:
-        if m.get("today_date") != today:
-            await sb.table("members").update({"today_score": 0, "today_date": today})\
-              .eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
-            m["today_score"] = 0
-    active = [m for m in members if (m.get("today_score") or 0) > 0]
-    if not active:
-        await message.answer(
-            f"❌ Сегодня никто не активен.\n{pet_line(pet)}\nВсего: {len(members)}",
-            parse_mode="HTML"); return
-    active.sort(key=lambda x: x["today_score"], reverse=True)
-    winners = active[:top_n] if (top_n and 0 < top_n < len(active)) else active
-    total = sum(w["today_score"] for w in winners)
-    if total <= 0: await message.answer("Нет очков."); return
-    min_share = min(round(amount * (w["today_score"]/total), 6) for w in winners)
-    if min_share < MIN_CHEQUE:
-        await message.answer(f"❌ Слишком мелкие чеки ({min_share:.4f})."); return
-
-    await sb.table("pets").update({"bank_balance": balance - amount}).eq("id", pet["id"]).execute()
-    po = await sb.table("payouts").insert({
-        "pet_id": pet["id"], "owner_id": owner_id, "total_amount": amount,
-        "currency": pet.get("currency","USDT"), "member_count": len(winners)}).execute()
-    payout = po.data[0]
-
-    await message.answer(
-        f"💸 Раздаю <b>{amount:.4f} USDT</b>\n{pet_line(pet)}\n"
-        f"Получателей: {len(winners)}",
-        parse_mode="HTML")
-
-    sent = 0; total_sent = 0.0; paid = []; failed_msg = ""
-    for m in winners:
-        score = m["today_score"]; share = round(amount * (score/total), 6)
-        if share < MIN_CHEQUE: continue
-        try:
-            ch = await create_cheque(m["user_id"], share, pet.get("currency","USDT"),
-                                     f"Зарплата · {pet['name']}")
-        except Exception as e:
-            d = getattr(e,"data",None) or {}
-            failed_msg = d.get("detail") or d.get("title") or str(e); break
-        cid = ch.get("chequeId") or ch.get("id"); link = pick_link(ch)
-        await sb.table("cheques").insert({
-            "payout_id": payout["id"], "pet_id": pet["id"], "user_id": m["user_id"],
-            "amount": share, "cheque_id": cid, "cheque_link": link,
-            "status": "sent" if link else "no_link"}).execute()
-        if link:
-            try:
-                await bot.send_message(m["user_id"],
-                    f"💰 <b>Зарплата</b>\n\n"
-                    f"Питомец: <b>{pet['name']}</b>\n"
-                    f"ID: <code>{pet['id']}</code>\n"
-                    f"Активность: {score} очков\n"
-                    f"Начислено: <b>{share:.4f} USDT</b>\n"
-                    f"Чек: <code>{cid}</code>\n\nЗабрать: {link}",
-                    parse_mode="HTML", disable_web_page_preview=True)
-            except: pass
-        sent += 1; total_sent += share; paid.append(m["user_id"])
-    refund = round(amount - total_sent, 6)
-    if refund > 0:
-        pn = await one(sb.table("pets").select("*").eq("id", pet["id"]))
-        cb = float(pn.get("bank_balance") or 0)
-        await sb.table("pets").update({"bank_balance": cb + refund}).eq("id", pet["id"]).execute()
-    for m in winners:
-        if m["user_id"] in paid:
-            await sb.table("members").update({"today_score": 0, "today_date": today})\
-              .eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
-    pn = await one(sb.table("pets").select("*").eq("id", pet["id"]))
-    final = float(pn.get("bank_balance") or 0)
-    text = (f"✅ <b>Выплата</b>\n{pet_line(pet)}\n"
-            f"Раздано: {total_sent:.4f} из {amount:.4f}\n"
-            f"Чеков: {sent} из {len(winners)}\n"
-            f"Остаток: <b>{final:.4f} USDT</b>")
-    if failed_msg: text += f"\n\n⚠️ {failed_msg}"
-    await message.answer(text, parse_mode="HTML")
-
-
-# ============ /pet — управление через чат ============
-
-PET_ACTIONS = {
-    "feed": {"emoji":"🍖","label":"Покормил","cd": 5*60, "xp": 2,
-             "effects": {"hunger": 25, "energy": 10}, "score": 1},
-    "pet":  {"emoji":"✋","label":"Погладил","cd": 60,   "xp": 1,
-             "effects": {"mood": 10}, "score": 1},
-    "play": {"emoji":"🎾","label":"Поиграл","cd": 10*60, "xp": 5,
-             "effects": {"mood": 20, "energy": -15}, "score": 2},
-    "wash": {"emoji":"🧼","label":"Помыл","cd": 15*60, "xp": 2,
-             "effects": {"clean": 30}, "score": 1},
-    "heal": {"emoji":"💊","label":"Полечил","cd": 60*60, "xp": 3,
-             "effects": {"health": 20}, "score": -30, "cost": 30},
-}
-
-PET_ALIASES = {
-    "покормить":"feed","покорми":"feed","кормить":"feed","feed":"feed","еда":"feed","кушать":"feed",
-    "погладить":"pet","погладь":"pet","гладить":"pet","ласка":"pet","pet":"pet",
-    "играть":"play","поиграть":"play","поиграй":"play","play":"play","игра":"play",
-    "помыть":"wash","помой":"wash","мыть":"wash","купать":"wash","искупать":"wash","wash":"wash",
-    "лечить":"heal","полечить":"heal","вылечить":"heal","heal":"heal","лечение":"heal",
-    "инфо":"info","статы":"info","stats":"info","информация":"info",
-    "кд":"kd","kd":"kd","кулдаун":"kd","кулдауны":"kd","cooldown":"kd","cooldowns":"kd","таймер":"kd",
-}
-
-PET_STAGE_NAMES = {
-    "classic": ["Яйцо","Птенец","Юнец","Подросток","Взрослый","Опытный","Старейшина","Легенда"],
-    "cat":     ["Яйцо","Котёнок","Котик","Подросший кот","Крупный кот","Хищник","Царь зверей","Тигр"],
-    "dragon":  ["Яйцо","Ящерка","Дракончик","Юный дракон","Дракон","Взрослый дракон","Древний дракон","Огненный владыка"],
-    "space":   ["Туманность","Луна","Звезда","Яркая звезда","Созвездие","Комета","Сверхновая","Солнце"],
-    "dino":    ["Яйцо","Ящерка","Динозаврик","Юный дино","Ящер","Хищный дино","Древний ящер","Вулкан"],
-}
-
+# ============ смерть ============
 
 def _stage_idx(level):
     return 7 if level>=28 else 6 if level>=24 else 5 if level>=20 else 4 if level>=16 \
@@ -501,13 +309,13 @@ def _stage_idx(level):
 
 
 def apply_pet_tick(pet):
+    if pet.get("dead"): return pet
     now = datetime.now(timezone.utc)
     last_str = pet.get("last_tick_at")
     if not last_str: return pet
     try:
         last = datetime.fromisoformat(last_str.replace("Z","+00:00"))
-    except Exception:
-        return pet
+    except Exception: return pet
     minutes = (now - last).total_seconds() / 60
     if minutes < 1: return pet
     hours = minutes / 60
@@ -528,22 +336,101 @@ def apply_pet_tick(pet):
     elif c["hunger"] > 60 and c["mood"] > 60 and c["clean"] > 60:
         c["health"] = cl((c.get("health") or 100) + 2*hours)
     c["last_tick_at"] = now.isoformat()
+    if c["health"] <= 0:
+        c["health"] = 0; c["dead"] = True; c["dead_at"] = now.isoformat()
     return c
 
 
 async def save_pet_tick(pet):
+    if pet.get("dead"): return pet
     ticked = apply_pet_tick(pet)
-    if ticked.get("last_tick_at") != pet.get("last_tick_at"):
-        await sb.table("pets").update({
+    if ticked.get("last_tick_at") != pet.get("last_tick_at") or ticked.get("dead"):
+        upd = {
             "hunger": ticked["hunger"], "mood": ticked["mood"],
             "energy": ticked["energy"], "clean": ticked["clean"],
             "health": ticked["health"], "last_tick_at": ticked["last_tick_at"],
-        }).eq("id", pet["id"]).execute()
+        }
+        if ticked.get("dead"):
+            upd["dead"] = True; upd["dead_at"] = ticked.get("dead_at")
+        await sb.table("pets").update(upd).eq("id", pet["id"]).execute()
     return ticked
+
+
+async def death_watch_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            pets = await many(sb.table("pets").select("*").eq("dead", False))
+            log.info("death_watch: %s живых", len(pets))
+            for pet in pets:
+                try:
+                    ticked = apply_pet_tick(pet)
+                    if ticked.get("last_tick_at") == pet.get("last_tick_at") and not ticked.get("dead"):
+                        continue
+                    upd = {
+                        "hunger": ticked["hunger"], "mood": ticked["mood"],
+                        "energy": ticked["energy"], "clean": ticked["clean"],
+                        "health": ticked["health"], "last_tick_at": ticked["last_tick_at"],
+                    }
+                    if ticked.get("dead"):
+                        upd["dead"] = True; upd["dead_at"] = ticked.get("dead_at")
+                    await sb.table("pets").update(upd).eq("id", pet["id"]).execute()
+                    if ticked.get("dead"):
+                        log.info("💀 умер: %s", pet["name"])
+                        try:
+                            await bot.send_message(
+                                pet["owner_id"],
+                                f"💀 <b>{escape_html(pet['name'])} умер…</b>\n\n"
+                                f"Ты слишком долго не заботился.\n"
+                                f"Возроди его в приложении за 100 очков.",
+                                parse_mode="HTML")
+                        except Exception as e:
+                            log.warning("death notify: %s", e)
+                except Exception as e:
+                    log.error("tick err %s: %s", pet.get("id"), e)
+        except Exception as e:
+            log.error("death_watch_loop: %s", e)
+        await asyncio.sleep(30 * 60)
+
+
+# ============ /pet ============
+
+PET_ACTIONS = {
+    "feed": {"emoji":"🍖","label":"Покормил","cd": 5*60, "xp": 2,
+             "effects": {"hunger": 25, "energy": 10}, "score": 1},
+    "pet":  {"emoji":"✋","label":"Погладил","cd": 60, "xp": 1,
+             "effects": {"mood": 10}, "score": 1},
+    "play": {"emoji":"🎾","label":"Поиграл","cd": 10*60, "xp": 5,
+             "effects": {"mood": 20, "energy": -15}, "score": 2},
+    "wash": {"emoji":"🧼","label":"Помыл","cd": 15*60, "xp": 2,
+             "effects": {"clean": 30}, "score": 1},
+    "heal": {"emoji":"💊","label":"Полечил","cd": 60*60, "xp": 3,
+             "effects": {"health": 20}, "score": -30, "cost": 30},
+}
+
+PET_ALIASES = {
+    "покормить":"feed","покорми":"feed","кормить":"feed","feed":"feed",
+    "погладить":"pet","погладь":"pet","гладить":"pet","pet":"pet",
+    "играть":"play","поиграть":"play","поиграй":"play","play":"play",
+    "помыть":"wash","помой":"wash","мыть":"wash","wash":"wash",
+    "лечить":"heal","полечить":"heal","heal":"heal",
+    "инфо":"info","статы":"info","stats":"info",
+    "кд":"kd","kd":"kd","кулдаун":"kd","cooldowns":"kd",
+}
+
+PET_STAGE_NAMES = {
+    "classic": ["Яйцо","Птенец","Юнец","Подросток","Взрослый","Опытный","Старейшина","Легенда"],
+    "cat":     ["Яйцо","Котёнок","Котик","Подросший кот","Крупный кот","Хищник","Царь зверей","Тигр"],
+    "dragon":  ["Яйцо","Ящерка","Дракончик","Юный дракон","Дракон","Взрослый дракон","Древний дракон","Огненный владыка"],
+    "space":   ["Туманность","Луна","Звезда","Яркая звезда","Созвездие","Комета","Сверхновая","Солнце"],
+    "dino":    ["Яйцо","Ящерка","Динозаврик","Юный дино","Ящер","Хищный дино","Древний ящер","Вулкан"],
+}
 
 
 async def _send_pet_info(message, pet):
     pet = await save_pet_tick(pet)
+    if pet.get("dead"):
+        await message.answer(f"💀 <b>{escape_html(pet['name'])} умер.</b>", parse_mode="HTML"); return
     lvl = min(30, (pet.get("xp") or 0) // 50 + 1)
     st = _stage_idx(lvl)
     names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
@@ -554,12 +441,6 @@ async def _send_pet_info(message, pet):
         f"⚡ Энергия: {pet.get('energy',0)}%\n"
         f"🧼 Чистота: {pet.get('clean',0)}%\n"
         f"❤️ Здоровье: {pet.get('health',0)}%\n\n"
-        f"<b>Действия:</b>\n"
-        f"<code>/pet {pet['name']} покормить</code>\n"
-        f"<code>/pet {pet['name']} погладить</code>\n"
-        f"<code>/pet {pet['name']} играть</code>\n"
-        f"<code>/pet {pet['name']} помыть</code>\n"
-        f"<code>/pet {pet['name']} лечить</code>\n\n"
         f"<code>/pet {pet['name']} kd</code> — кулдауны"
     )
     await message.answer(text, parse_mode="HTML")
@@ -567,79 +448,42 @@ async def _send_pet_info(message, pet):
 
 async def _send_pet_help(message):
     await message.answer(
-        "🐾 <b>Управление питомцем в чате</b>\n\n"
-        "<b>Команды:</b>\n"
-        "<code>/pet</code> — список твоих питомцев\n"
-        "<code>/pet ИМЯ</code> — показать статы\n"
-        "<code>/pet ИМЯ kd</code> — кулдауны на действия\n"
-        "<code>/pet ИМЯ покормить</code> — +25 сытости, +10 энергии\n"
-        "<code>/pet ИМЯ погладить</code> — +10 настроения\n"
-        "<code>/pet ИМЯ играть</code> — +20 настроения, −15 энергии\n"
-        "<code>/pet ИМЯ помыть</code> — +30 чистоты\n"
-        "<code>/pet ИМЯ лечить</code> — +20 здоровья (30 очков)\n\n"
-        "<b>Синонимы:</b> покорми=покормить=feed, поиграй=играть=play, кд=кулдаун=cooldown\n\n"
-        "<b>Кулдауны:</b>\n"
-        "🍖 покормить — 5 мин\n"
-        "✋ погладить — 1 мин\n"
-        "🎾 играть — 10 мин\n"
-        "🧼 помыть — 15 мин\n"
-        "💊 лечить — 1 час\n\n"
-        "Очки и XP идут в общий счёт питомца и в топ.",
-        parse_mode="HTML"
-    )
+        "🐾 <b>Управление питомцем</b>\n\n"
+        "<code>/pet</code> — список\n"
+        "<code>/pet ИМЯ</code> — статы\n"
+        "<code>/pet ИМЯ kd</code> — кулдауны\n"
+        "<code>/pet ИМЯ покормить</code>\n"
+        "<code>/pet ИМЯ погладить</code>\n"
+        "<code>/pet ИМЯ играть</code>\n"
+        "<code>/pet ИМЯ помыть</code>\n"
+        "<code>/pet ИМЯ лечить</code>",
+        parse_mode="HTML")
 
 
 async def _send_pet_kd(message, pet, user):
-    """Показать кулдауны пользователя на действия с питомцем."""
     mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", user.id))
     if not mem:
-        await message.answer("Ты не участник этого питомца. Открой ссылку-приглашение.")
-        return
-
+        await message.answer("Ты не участник."); return
     now = datetime.now(timezone.utc)
-    lines = [f"⏱ <b>Кулдауны на {escape_html(pet['name'])}</b>"]
-    uname = escape_html(user.first_name or "Гость")
-    lines.append(f"<i>для {uname}</i>\n")
-
+    lines = [f"⏱ <b>Кулдауны на {escape_html(pet['name'])}</b>\n"]
     any_cd = False
-    for key in ("feed", "pet", "play", "wash", "heal"):
+    for key in ("feed","pet","play","wash","heal"):
         cfg = PET_ACTIONS[key]
-        last_str = mem.get("last_" + key + "_at")
-        emoji = cfg["emoji"]
-        label = cfg["label"]
-
-        if not last_str:
-            lines.append(f"{emoji} {label} — <b>готово</b>")
-            continue
-
-        try:
-            last_dt = datetime.fromisoformat(last_str.replace("Z", "+00:00"))
-        except Exception:
-            lines.append(f"{emoji} {label} — <b>готово</b>")
-            continue
-
-        passed = (now - last_dt).total_seconds()
-        left = cfg["cd"] - passed
-
+        ls = mem.get("last_"+key+"_at")
+        if not ls:
+            lines.append(f"{cfg['emoji']} {cfg['label']} — готово"); continue
+        try: last_dt = datetime.fromisoformat(ls.replace("Z","+00:00"))
+        except: lines.append(f"{cfg['emoji']} {cfg['label']} — готово"); continue
+        left = cfg["cd"] - (now - last_dt).total_seconds()
         if left <= 0:
-            lines.append(f"{emoji} {label} — <b>готово</b>")
+            lines.append(f"{cfg['emoji']} {cfg['label']} — готово")
         else:
             any_cd = True
-            mm = int(left // 60)
-            ss = int(left % 60)
-            if mm >= 60:
-                hh = mm // 60
-                mm = mm % 60
-                t = f"{hh} ч {mm} мин"
-            elif mm > 0:
-                t = f"{mm} мин {ss} сек"
-            else:
-                t = f"{ss} сек"
-            lines.append(f"{emoji} {label} — ⏳ <b>{t}</b>")
-
-    if not any_cd:
-        lines.append("\n✨ <b>Все действия доступны!</b>")
-
+            mm, ss = int(left // 60), int(left % 60)
+            t = (f"{mm//60} ч {mm%60} мин" if mm>=60 else
+                 f"{mm} мин {ss} сек" if mm>0 else f"{ss} сек")
+            lines.append(f"{cfg['emoji']} {cfg['label']} — ⏳ <b>{t}</b>")
+    if not any_cd: lines.append("\n✨ Всё готово!")
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -649,114 +493,79 @@ async def cmd_pet(message: Message):
     parts = (message.text or "").split()
     args = parts[1:] if len(parts) > 1 else []
 
-    # /pet help — справка
-    if args and args[0].lower() in ("help", "помощь", "хелп", "?", "справка"):
-        await _send_pet_help(message)
-        return
+    if args and args[0].lower() in ("help","помощь","хелп","?","справка"):
+        await _send_pet_help(message); return
 
     if not args:
         members = await many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
         if not members:
-            await message.answer("У тебя нет питомцев. Создай через /start")
-            return
+            await message.answer("У тебя нет питомцев. Создай в приложении."); return
         lines = ["🐾 <b>Твои питомцы:</b>\n"]
         for m in members[:10]:
             p = m.get("pets") or {}
             lvl = min(30, (p.get("xp") or 0) // 50 + 1)
-            lines.append(f"• <b>{p['name']}</b> · ур. {lvl}\n  <code>/pet {p['name']}</code>")
+            dead = " 💀" if p.get("dead") else ""
+            lines.append(f"• <b>{p['name']}</b>{dead} · ур. {lvl}\n  <code>/pet {p['name']}</code>")
         lines.append("\n<code>/pet help</code> — справка")
-        await message.answer("\n".join(lines), parse_mode="HTML")
-        return
+        await message.answer("\n".join(lines), parse_mode="HTML"); return
 
     name_query = args[0].strip()
     action_key = args[1].lower() if len(args) > 1 else None
-
-    pet = None
     members = await many(sb.table("members").select("pets!inner(*)").eq("user_id", user.id))
-
-    if len(name_query) >= 30 and "-" in name_query:
-        candidate = await one(sb.table("pets").select("*").eq("id", name_query))
-        if candidate:
-            ok = await one(sb.table("members").select("*").eq("pet_id", candidate["id"]).eq("user_id", user.id))
-            if ok: pet = candidate
-    else:
-        nq = name_query.lower()
+    nq = name_query.lower()
+    pet = None
+    for m in members:
+        p = m.get("pets") or {}
+        if (p.get("name") or "").lower() == nq: pet = p; break
+    if not pet:
         for m in members:
             p = m.get("pets") or {}
-            if (p.get("name") or "").lower() == nq:
-                pet = p; break
-        if not pet:
-            for m in members:
-                p = m.get("pets") or {}
-                if nq in (p.get("name") or "").lower():
-                    pet = p; break
-
+            if nq in (p.get("name") or "").lower(): pet = p; break
     if not pet:
-        await message.answer(f"🐾 Питомец «{escape_html(name_query)}» не найден среди твоих. Список: /pet")
-        return
+        await message.answer(f"🐾 «{escape_html(name_query)}» не найден. /pet"); return
+
+    if pet.get("dead"):
+        await message.answer(f"💀 {escape_html(pet['name'])} умер. Возроди в приложении.",
+                             parse_mode="HTML"); return
 
     if not action_key:
-        await _send_pet_info(message, pet)
-        return
-
+        await _send_pet_info(message, pet); return
     action = PET_ALIASES.get(action_key)
-    if action == "info":
-        await _send_pet_info(message, pet)
-        return
-    if action == "kd":
-        await _send_pet_kd(message, pet, user)
-        return
+    if action == "info": await _send_pet_info(message, pet); return
+    if action == "kd": await _send_pet_kd(message, pet, user); return
     if not action:
-        await message.answer(
-            f"Не понимаю действие «{escape_html(action_key)}».\n\n"
-            f"<b>Что можно:</b> покормить · погладить · играть · помыть · лечить · kd\n"
-            f"Например: <code>/pet {escape_html(pet['name'])} покормить</code>\n\n"
-            f"Справка: <code>/pet help</code>",
-            parse_mode="HTML"
-        )
-        return
+        await message.answer(f"Не понимаю «{escape_html(action_key)}». /pet help", parse_mode="HTML"); return
 
     cfg = PET_ACTIONS[action]
-    user_id = user.id
-
     pet = await one(sb.table("pets").select("*").eq("id", pet["id"]))
-    if not pet:
-        await message.answer("Питомец не найден"); return
+    if not pet or pet.get("dead"): return
     pet = await save_pet_tick(pet)
+    if pet.get("dead"): return
+    mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", user.id))
+    if not mem: await message.answer("Ты не участник."); return
 
-    mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", user_id))
-    if not mem:
-        await message.answer("Ты не участник этого питомца. Открой ссылку-приглашение.")
-        return
-
-    last_key = "last_" + action + "_at"
-    last_str = mem.get(last_key)
-    if last_str:
+    last_key = "last_"+action+"_at"
+    ls = mem.get(last_key)
+    if ls:
         try:
-            last_dt = datetime.fromisoformat(last_str.replace("Z","+00:00"))
-            passed = (datetime.now(timezone.utc) - last_dt).total_seconds()
-            if passed < cfg["cd"]:
-                left = int(cfg["cd"] - passed)
-                mm, ss = left // 60, left % 60
+            last_dt = datetime.fromisoformat(ls.replace("Z","+00:00"))
+            left = cfg["cd"] - (datetime.now(timezone.utc) - last_dt).total_seconds()
+            if left > 0:
+                mm, ss = int(left // 60), int(left % 60)
                 t = f"{mm} мин {ss} сек" if mm else f"{ss} сек"
-                await message.answer(f"⌛ {escape_html(user.first_name or 'Гость')}, ещё рано. Подожди {t}.")
-                return
-        except Exception: pass
+                await message.answer(f"⌛ Ещё рано. Ждать {t}."); return
+        except: pass
 
     score = mem.get("score") or 0
     if cfg.get("cost") and score < cfg["cost"]:
-        await message.answer(f"❌ Не хватает очков: нужно {cfg['cost']}, у тебя {score}.")
-        return
+        await message.answer(f"❌ Нужно {cfg['cost']} очков, у тебя {score}."); return
 
     new_pet = dict(pet)
     for k, v in cfg["effects"].items():
-        old = new_pet.get(k) or 0
-        new_pet[k] = max(0, min(100, old + v))
+        new_pet[k] = max(0, min(100, (new_pet.get(k) or 0) + v))
     new_pet["xp"] = (pet.get("xp") or 0) + cfg["xp"]
-
-    old_lvl = min(30, (pet.get("xp") or 0) // 50 + 1)
-    new_lvl = min(30, new_pet["xp"] // 50 + 1)
-    old_st = _stage_idx(old_lvl); new_st = _stage_idx(new_lvl)
+    old_st = _stage_idx(min(30, (pet.get("xp") or 0) // 50 + 1))
+    new_st = _stage_idx(min(30, new_pet["xp"] // 50 + 1))
 
     await sb.table("pets").update({
         "hunger": new_pet["hunger"], "mood": new_pet["mood"],
@@ -768,39 +577,179 @@ async def cmd_pet(message: Message):
     iso_now = datetime.now(timezone.utc).isoformat()
     today_iso = datetime.now(timezone.utc).date().isoformat()
     new_score = score + cfg["score"]
-    member_upd = {"score": new_score, last_key: iso_now}
+    m_upd = {"score": new_score, last_key: iso_now}
     if mem.get("today_date") == today_iso:
-        member_upd["today_score"] = (mem.get("today_score") or 0) + max(cfg["score"], 0)
+        m_upd["today_score"] = (mem.get("today_score") or 0) + max(cfg["score"], 0)
     else:
-        member_upd["today_score"] = max(cfg["score"], 0)
-        member_upd["today_date"] = today_iso
-    await sb.table("members").update(member_upd).eq("pet_id", pet["id"]).eq("user_id", user_id).execute()
+        m_upd["today_score"] = max(cfg["score"], 0)
+        m_upd["today_date"] = today_iso
+    await sb.table("members").update(m_upd).eq("pet_id", pet["id"]).eq("user_id", user.id).execute()
 
     try:
         await sb.table("events").insert({
-            "pet_id": pet["id"], "user_id": user_id,
-            "first_name": user.first_name or "Гость",
-            "action": action,
+            "pet_id": pet["id"], "user_id": user.id,
+            "first_name": user.first_name or "Гость", "action": action,
         }).execute()
-    except Exception: pass
+    except: pass
 
     uname = escape_html(user.first_name or "Кто-то")
     changed = []
     for k, v in cfg["effects"].items():
-        label = {"hunger":"сытость","mood":"настроение","energy":"энергия",
-                 "clean":"чистота","health":"здоровье"}.get(k, k)
-        sign = "+" if v > 0 else "−"
-        changed.append(f"{label} {sign}{abs(v)}")
-
+        lbl = {"hunger":"сытость","mood":"настроение","energy":"энергия",
+               "clean":"чистота","health":"здоровье"}.get(k, k)
+        changed.append(f"{lbl} {'+' if v>0 else '−'}{abs(v)}")
     text = f"{cfg['emoji']} <b>{uname}</b> — {cfg['label'].lower()} <b>{escape_html(pet['name'])}</b>"
-    if changed:
-        text += "\n  " + " · ".join(changed)
-
+    if changed: text += "\n  " + " · ".join(changed)
     if new_st > old_st:
         names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
-        text += f"\n\n✨ <b>Эволюция!</b> {escape_html(pet['name'])} теперь <b>{names[new_st]}</b>"
-
+        text += f"\n\n✨ <b>Эволюция!</b> Теперь <b>{names[new_st]}</b>"
     await message.answer(text, parse_mode="HTML")
+
+
+# ============ create ============
+
+@dp.callback_query(F.data == "create")
+async def cb_create(call: CallbackQuery):
+    user = call.from_user
+    existing = await my_pets(user.id, alive_only=True)
+    if existing:
+        await call.answer("У тебя уже есть питомец", show_alert=True); return
+    total = await count_alive_pets()
+    if total >= GLOBAL_PET_LIMIT:
+        await call.answer(f"Все {GLOBAL_PET_LIMIT} питомцев заняты", show_alert=True); return
+
+    pet = None
+    for _ in range(5):
+        code = gen_code()
+        try:
+            r = await sb.table("pets").insert({"owner_id": user.id, "invite_code": code}).execute()
+            if r.data: pet = r.data[0]; break
+        except Exception as e:
+            if "23505" not in str(e): break
+    if not pet: await call.answer("Ошибка.", show_alert=True); return
+
+    await sb.table("members").insert({
+        "pet_id": pet["id"], "user_id": user.id,
+        "first_name": user.first_name or "Гость", "username": user.username,
+    }).execute()
+    await call.answer("Готово!")
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=join_{pet['invite_code']}"
+    share = f"https://t.me/share/url?url={link}&text=Ухаживай за питомцем!"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🐾 Открыть", web_app=WebAppInfo(url=webapp_url(pet["id"])))],
+        [InlineKeyboardButton(text="📤 Поделиться", url=share)]])
+    left = GLOBAL_PET_LIMIT - (total + 1)
+    await call.message.answer(
+        f"🐣 <b>Питомец создан!</b>\n\n<b>{pet['name']}</b>\nID: <code>{pet['id']}</code>\n\n"
+        f"Свободных мест: <b>{left} / {GLOBAL_PET_LIMIT}</b>\n\nСсылка:\n<code>{link}</code>",
+        parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "my_pets")
+async def cb_my_pets(call: CallbackQuery):
+    await call.answer()
+    data = await many(sb.table("members").select("pet_id, pets!inner(id, name, xp, dead)")\
+                .eq("user_id", call.from_user.id).order("score", desc=True).limit(20))
+    if not data: await call.message.answer("Нет питомцев."); return
+    rows = []
+    lines = ["📋 <b>Твои питомцы:</b>\n"]
+    for m in data:
+        p = m.get("pets") or {}
+        if not p: continue
+        lvl = min(30, (p.get("xp") or 0)//50+1)
+        dead = " 💀" if p.get("dead") else ""
+        lines.append(f"• <b>{p['name']}</b>{dead} · ур. {lvl}")
+        rows.append([InlineKeyboardButton(text=f"🐾 {p['name']}{dead} · ур. {lvl}",
+                     web_app=WebAppInfo(url=webapp_url(p["id"])))])
+    await call.message.answer("\n".join(lines), parse_mode="HTML",
+                              reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+# ============ /salary ============
+
+@dp.message(Command("salary"))
+async def cmd_salary(m: Message):
+    parts = m.text.split()
+    if len(parts) < 2: await m.answer("Формат: /salary <pet_id> 1 3"); return
+    pid = parts[1]
+    if not is_uuid(pid): await m.answer("UUID нужен."); return
+    amount = None; top_n = None
+    if len(parts) >= 3:
+        try: amount = float(parts[2].replace(",","."))
+        except: pass
+    if len(parts) >= 4:
+        try: top_n = int(parts[3])
+        except: pass
+    await run_salary_pet(pid, m.from_user.id, amount, top_n, m)
+
+
+async def run_salary_pet(pet_id, owner_id, amount, top_n, message):
+    pet = await one(sb.table("pets").select("*").eq("id", pet_id))
+    if not pet or pet["owner_id"] != owner_id:
+        await message.answer("Только владелец."); return
+    balance = float(pet.get("bank_balance") or 0)
+    if balance <= 0: await message.answer("Банк пуст."); return
+    if amount is None or amount <= 0: amount = balance
+    if amount > balance: await message.answer(f"В банке только {balance:.4f}."); return
+
+    today = date.today().isoformat()
+    members = await many(sb.table("members").select("*").eq("pet_id", pet["id"]))
+    for m in members:
+        if m.get("today_date") != today:
+            await sb.table("members").update({"today_score": 0, "today_date": today})\
+              .eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
+            m["today_score"] = 0
+    active = [m for m in members if (m.get("today_score") or 0) > 0]
+    if not active: await message.answer("Сегодня нет активных."); return
+    active.sort(key=lambda x: x["today_score"], reverse=True)
+    winners = active[:top_n] if (top_n and 0 < top_n < len(active)) else active
+    total = sum(w["today_score"] for w in winners)
+    if total <= 0: await message.answer("Нет очков."); return
+    min_share = min(round(amount * (w["today_score"]/total), 6) for w in winners)
+    if min_share < MIN_CHEQUE:
+        await message.answer(f"Слишком мелкие чеки ({min_share:.4f})."); return
+
+    await sb.table("pets").update({"bank_balance": balance - amount}).eq("id", pet["id"]).execute()
+    po = await sb.table("payouts").insert({
+        "pet_id": pet["id"], "owner_id": owner_id, "total_amount": amount,
+        "currency": pet.get("currency","USDT"), "member_count": len(winners)}).execute()
+    payout = po.data[0]
+    sent = 0; total_sent = 0.0; paid = []
+    for m in winners:
+        score = m["today_score"]; share = round(amount * (score/total), 6)
+        if share < MIN_CHEQUE: continue
+        try:
+            ch = await create_cheque(m["user_id"], share, pet.get("currency","USDT"),
+                                     f"Зарплата · {pet['name']}")
+        except Exception as e:
+            log.error("cheque: %s", e); break
+        cid = ch.get("chequeId") or ch.get("id"); link = pick_link(ch)
+        await sb.table("cheques").insert({
+            "payout_id": payout["id"], "pet_id": pet["id"], "user_id": m["user_id"],
+            "amount": share, "cheque_id": cid, "cheque_link": link,
+            "status": "sent" if link else "no_link"}).execute()
+        if link:
+            try:
+                await bot.send_message(m["user_id"],
+                    f"💰 <b>Зарплата</b>\n\nПитомец: <b>{pet['name']}</b>\n"
+                    f"ID: <code>{pet['id']}</code>\nАктивность: {score} очков\n"
+                    f"Начислено: <b>{share:.4f} USDT</b>\n\nЗабрать: {link}",
+                    parse_mode="HTML", disable_web_page_preview=True)
+            except: pass
+        sent += 1; total_sent += share; paid.append(m["user_id"])
+    refund = round(amount - total_sent, 6)
+    if refund > 0:
+        pn = await one(sb.table("pets").select("*").eq("id", pet["id"]))
+        cb = float(pn.get("bank_balance") or 0)
+        await sb.table("pets").update({"bank_balance": cb + refund}).eq("id", pet["id"]).execute()
+    for m in winners:
+        if m["user_id"] in paid:
+            await sb.table("members").update({"today_score": 0, "today_date": today})\
+              .eq("pet_id", pet["id"]).eq("user_id", m["user_id"]).execute()
+    await message.answer(
+        f"✅ Раздано {total_sent:.4f} из {amount:.4f}\nЧеков: {sent} из {len(winners)}",
+        parse_mode="HTML")
 
 
 # ============ АДМИНКА ============
@@ -808,30 +757,73 @@ async def cmd_pet(message: Message):
 @dp.message(Command("admin"))
 async def cmd_admin(m: Message):
     if not is_admin(m.from_user.id): return
+    alive = await count_alive_pets()
     await m.answer(
-        "🛠 <b>Админка</b>\n\n"
-        "<b>Мои питомцы:</b>\n"
-        "/my_pets_admin — мои питомцы с ID\n"
-        "/list_pets — все питомцы бота\n\n"
-        "<b>Очки:</b>\n"
-        "/addscore [pet_id] 100 — себе\n"
-        "/addscore_user [pet_id] &lt;uid&gt; 100 — юзеру\n"
-        "/setscore_user [pet_id] &lt;uid&gt; 100 — установить\n\n"
-        "<b>XP:</b>\n"
-        "/xp [pet_id] — статистика\n"
-        "/addxp [pet_id] 200 — добавить\n"
-        "/setxp [pet_id] 1000 — установить\n\n"
-        "<b>Баланс:</b>\n"
-        "/setbal [pet_id] 5\n"
-        "/addbal [pet_id] 1\n\n"
-        "<b>Скин:</b>\n"
-        "/setskin [pet_id] classic|cat|dragon|space|dino\n\n"
-        "<b>Прочее:</b>\n"
-        "/reset_scores — обнулить дневные очки\n"
-        "/cheques [pet_id] — чеки питомца\n"
-        "/cancel_cheques [pet_id] — отменить чеки\n"
-        "/xr — баланс xRocket",
+        f"🛠 <b>Админка</b>\n\n"
+        f"Живых питомцев: <b>{alive} / {GLOBAL_PET_LIMIT}</b>\n\n"
+        "/fees — собранные комиссии\n"
+        "/revive &lt;id&gt; — возродить питомца\n"
+        "/kill &lt;id&gt; — убить питомца\n"
+        "/list_pets — все питомцы\n"
+        "/my_pets_admin — мои питомцы\n"
+        "/addscore &lt;id&gt; 100\n"
+        "/addxp &lt;id&gt; 200\n"
+        "/setbal &lt;id&gt; 5\n"
+        "/setskin &lt;id&gt; cat\n"
+        "/reset_scores\n"
+        "/xr — xRocket",
         parse_mode="HTML")
+
+
+@dp.message(Command("fees"))
+async def cmd_fees(m: Message):
+    if not is_admin(m.from_user.id): return
+    rows = await many(sb.table("platform_fees").select("*").order("created_at", desc=True).limit(100))
+    if not rows:
+        await m.answer("Комиссий пока нет."); return
+    total = sum(float(r.get("amount") or 0) for r in rows)
+    lines = [f"💰 <b>Комиссии (5%)</b>\n\nВсего: <b>{total:.4f} USDT</b> (последние {len(rows)})\n"]
+    by_owner = {}
+    for r in rows:
+        oid = r.get("owner_id")
+        by_owner[oid] = by_owner.get(oid, 0) + float(r.get("amount") or 0)
+    lines.append("<b>По владельцам:</b>")
+    for oid, amt in sorted(by_owner.items(), key=lambda x: -x[1])[:10]:
+        lines.append(f"• <code>{oid}</code> — {amt:.4f}")
+    lines.append("\n<b>Последние:</b>")
+    for r in rows[:10]:
+        dt = (r.get("created_at") or "")[:16].replace("T", " ")
+        lines.append(f"• {dt} — {float(r.get('amount') or 0):.4f} от <code>{r.get('owner_id')}</code>")
+    await m.answer("\n".join(lines), parse_mode="HTML")
+
+
+@dp.message(Command("revive"))
+async def cmd_revive(m: Message):
+    if not is_admin(m.from_user.id): return
+    parts = m.text.split()
+    if len(parts) < 2: await m.answer("Формат: /revive <pet_id>"); return
+    pid = parts[1]
+    if not is_uuid(pid): await m.answer("UUID нужен."); return
+    now = datetime.now(timezone.utc).isoformat()
+    await sb.table("pets").update({
+        "dead": False, "dead_at": None,
+        "health": 50, "hunger": 50, "mood": 50, "clean": 50, "energy": 50,
+        "last_tick_at": now,
+    }).eq("id", pid).execute()
+    await m.answer(f"✅ Возрождён: <code>{pid}</code>", parse_mode="HTML")
+
+
+@dp.message(Command("kill"))
+async def cmd_kill(m: Message):
+    if not is_admin(m.from_user.id): return
+    parts = m.text.split()
+    if len(parts) < 2: await m.answer("Формат: /kill <pet_id>"); return
+    pid = parts[1]
+    if not is_uuid(pid): await m.answer("UUID нужен."); return
+    await sb.table("pets").update({
+        "dead": True, "dead_at": datetime.now(timezone.utc).isoformat(), "health": 0,
+    }).eq("id", pid).execute()
+    await m.answer(f"💀 Убит: <code>{pid}</code>", parse_mode="HTML")
 
 
 @dp.message(Command("my_pets_admin"))
@@ -842,181 +834,82 @@ async def cmd_my_pets_admin(m: Message):
     lines = ["🐾 <b>Твои питомцы:</b>\n"]
     for p in pets:
         lvl = min(30, (p.get("xp") or 0) // 50 + 1)
-        lines.append(
-            f"• <b>{p['name']}</b> · ур. {lvl}\n"
-            f"  ID: <code>{p['id']}</code>\n"
-            f"  Баланс: {float(p.get('bank_balance') or 0):.4f} · XP: {p.get('xp') or 0} · скин: {p.get('skin','classic')}"
-        )
+        dead = " 💀" if p.get("dead") else ""
+        lines.append(f"• <b>{p['name']}</b>{dead} · ур. {lvl}\n  <code>{p['id']}</code>\n"
+                     f"  Баланс: {float(p.get('bank_balance') or 0):.4f} · XP: {p.get('xp') or 0}")
     await m.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("list_pets"))
 async def cmd_list_pets(m: Message):
     if not is_admin(m.from_user.id): return
-    pets = await many(sb.table("pets").select("id,name,owner_id,bank_balance,xp,skin"))
-    if not pets: await m.answer("Нет питомцев."); return
-    lines = ["🌍 <b>Все питомцы бота:</b>\n"]
+    pets = await many(sb.table("pets").select("*").limit(50))
+    alive = sum(1 for p in pets if not p.get("dead"))
+    lines = [f"🌍 <b>Питомцы ({alive} живых / {GLOBAL_PET_LIMIT}):</b>\n"]
     for p in pets[:40]:
         lvl = min(30, (p.get("xp") or 0) // 50 + 1)
+        dead = " 💀" if p.get("dead") else ""
         mine = " ⭐" if p["owner_id"] == m.from_user.id else ""
-        lines.append(
-            f"• <b>{p['name']}</b>{mine} · ур. {lvl}\n"
-            f"  <code>{p['id']}</code> · owner <code>{p['owner_id']}</code>\n"
-            f"  {float(p.get('bank_balance') or 0):.4f} USDT · {p.get('xp') or 0} XP"
-        )
+        lines.append(f"• <b>{p['name']}</b>{dead}{mine} · ур. {lvl} · <code>{p['id'][:8]}</code>")
     await m.answer("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(Command("addscore"))
 async def cmd_addscore(m: Message):
     if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if not rest:
-        await m.answer("Формат: /addscore [pet_id] 100"); return
-    try: amount = int(rest[0])
+    parts = m.text.split()
+    if len(parts) < 3: await m.answer("Формат: /addscore <pet_id> 100"); return
+    pid = parts[1]
+    try: amount = int(parts[2])
     except: await m.answer("Не число."); return
-    mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", m.from_user.id))
+    if not is_uuid(pid): await m.answer("UUID нужен."); return
+    mem = await one(sb.table("members").select("*").eq("pet_id", pid).eq("user_id", m.from_user.id))
     if not mem: await m.answer("Ты не участник."); return
     ns = (mem.get("score") or 0) + amount
-    await sb.table("members").update({"score": ns}).eq("pet_id", pet["id"]).eq("user_id", m.from_user.id).execute()
-    await m.answer(
-        f"✅ <b>Очки: {mem.get('score') or 0} → {ns}</b>\n{pet_line(pet)}",
-        parse_mode="HTML")
-
-
-@dp.message(Command("addscore_user"))
-async def cmd_addscore_user(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if len(rest) < 2:
-        await m.answer("Формат: /addscore_user [pet_id] <uid> 100"); return
-    try: uid = int(rest[0]); amount = int(rest[1])
-    except: await m.answer("Не числа."); return
-    mem = await one(sb.table("members").select("*").eq("pet_id", pet["id"]).eq("user_id", uid))
-    if not mem: await m.answer(f"Юзер <code>{uid}</code> не участник.", parse_mode="HTML"); return
-    ns = (mem.get("score") or 0) + amount
-    await sb.table("members").update({"score": ns}).eq("pet_id", pet["id"]).eq("user_id", uid).execute()
-    await m.answer(
-        f"✅ <b>Очки юзера {uid}: {mem.get('score') or 0} → {ns}</b>\n{pet_line(pet)}",
-        parse_mode="HTML")
-
-
-@dp.message(Command("setscore_user"))
-async def cmd_setscore_user(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if len(rest) < 2:
-        await m.answer("Формат: /setscore_user [pet_id] <uid> 100"); return
-    try: uid = int(rest[0]); amount = int(rest[1])
-    except: await m.answer("Не числа."); return
-    await sb.table("members").update({"score": amount}).eq("pet_id", pet["id"]).eq("user_id", uid).execute()
-    await m.answer(
-        f"✅ <b>Очки юзера {uid} = {amount}</b>\n{pet_line(pet)}",
-        parse_mode="HTML")
-
-
-@dp.message(Command("xp"))
-async def cmd_xp(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, _ = await resolve_pet(m, args)
-    if not pet: return
-    xp = pet.get("xp") or 0
-    lvl = min(30, xp // 50 + 1)
-    sidx = _stage_idx(lvl)
-    names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
-    await m.answer(
-        f"📊 <b>Статистика</b>\n{pet_line(pet)}\n"
-        f"XP: <b>{xp}</b>\nУр.: <b>{lvl}</b>/30\n"
-        f"Стадия: {names[sidx]}\nДо след.: {50 - (xp % 50)} XP",
-        parse_mode="HTML")
+    await sb.table("members").update({"score": ns}).eq("pet_id", pid).eq("user_id", m.from_user.id).execute()
+    await m.answer(f"✅ Очки: {mem.get('score') or 0} → {ns}")
 
 
 @dp.message(Command("addxp"))
 async def cmd_addxp(m: Message):
     if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if not rest: await m.answer("Формат: /addxp [pet_id] 200"); return
-    try: amount = int(rest[0])
+    parts = m.text.split()
+    if len(parts) < 3: await m.answer("Формат: /addxp <pet_id> 200"); return
+    pid = parts[1]
+    try: amount = int(parts[2])
     except: await m.answer("Не число."); return
-    await _apply_xp(pet, amount, m, "add")
-
-
-@dp.message(Command("setxp"))
-async def cmd_setxp(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if not rest: await m.answer("Формат: /setxp [pet_id] 1000"); return
-    try: amount = int(rest[0])
-    except: await m.answer("Не число."); return
-    await _apply_xp(pet, amount, m, "set")
-
-
-async def _apply_xp(pet, amount, message, mode):
-    ox = pet.get("xp") or 0
-    nx = amount if mode == "set" else ox + amount
-    if nx < 0: nx = 0
-    await sb.table("pets").update({"xp": nx}).eq("id", pet["id"]).execute()
-    def lvl(x): return min(30, x // 50 + 1)
-    ol, nl = lvl(ox), lvl(nx)
-    os_, ns_ = _stage_idx(ol), _stage_idx(nl)
-    names = PET_STAGE_NAMES.get(pet.get("skin","classic"), PET_STAGE_NAMES["classic"])
-    text = (f"✅ <b>XP {'установлен' if mode=='set' else 'добавлен'}</b>\n{pet_line(pet)}\n\n"
-            f"XP: {ox} → <b>{nx}</b>\nУр.: {ol} → <b>{nl}</b>")
-    if ns_ != os_: text += f"\n✨ <b>Эволюция!</b> {names[os_]} → {names[ns_]}"
-    await message.answer(text, parse_mode="HTML")
+    if not is_uuid(pid): await m.answer("UUID нужен."); return
+    pet = await one(sb.table("pets").select("*").eq("id", pid))
+    if not pet: await m.answer("Не найден."); return
+    ox = pet.get("xp") or 0; nx = max(0, ox + amount)
+    await sb.table("pets").update({"xp": nx}).eq("id", pid).execute()
+    await m.answer(f"✅ XP: {ox} → {nx}")
 
 
 @dp.message(Command("setbal"))
 async def cmd_setbal(m: Message):
     if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if not rest: await m.answer("Формат: /setbal [pet_id] 5"); return
-    try: amount = float(rest[0].replace(",","."))
+    parts = m.text.split()
+    if len(parts) < 3: await m.answer("Формат: /setbal <pet_id> 5"); return
+    pid = parts[1]
+    try: amount = float(parts[2].replace(",","."))
     except: await m.answer("Не разобрать."); return
-    await sb.table("pets").update({"bank_balance": amount}).eq("id", pet["id"]).execute()
-    await m.answer(f"✅ <b>Баланс: {amount:.4f} USDT</b>\n{pet_line(pet)}", parse_mode="HTML")
-
-
-@dp.message(Command("addbal"))
-async def cmd_addbal(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if not rest: await m.answer("Формат: /addbal [pet_id] 1"); return
-    try: amount = float(rest[0].replace(",","."))
-    except: await m.answer("Не разобрать."); return
-    nb = float(pet.get("bank_balance") or 0) + amount
-    await sb.table("pets").update({"bank_balance": nb}).eq("id", pet["id"]).execute()
-    await m.answer(f"✅ <b>Баланс: {nb:.4f} USDT</b>\n{pet_line(pet)}", parse_mode="HTML")
+    if not is_uuid(pid): await m.answer("UUID нужен."); return
+    await sb.table("pets").update({"bank_balance": amount}).eq("id", pid).execute()
+    await m.answer(f"✅ Баланс: {amount:.4f}")
 
 
 @dp.message(Command("setskin"))
 async def cmd_setskin(m: Message):
     if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, rest = await resolve_pet(m, args)
-    if not pet: return
-    if not rest:
-        await m.answer(f"Формат: /setskin [pet_id] <{'|'.join(SKINS)}>\n\nТекущий скин: {pet.get('skin','classic')}"); return
-    skin = rest[0].lower()
-    if skin not in SKINS:
-        await m.answer(f"Доступные: {', '.join(SKINS)}"); return
-    await sb.table("pets").update({"skin": skin}).eq("id", pet["id"]).execute()
-    await m.answer(f"✅ <b>Скин: {skin}</b>\n{pet_line(pet)}", parse_mode="HTML")
+    parts = m.text.split()
+    if len(parts) < 3:
+        await m.answer(f"Формат: /setskin <pet_id> <{'|'.join(SKINS)}>"); return
+    pid = parts[1]; skin = parts[2].lower()
+    if not is_uuid(pid): await m.answer("UUID нужен."); return
+    if skin not in SKINS: await m.answer(f"Доступные: {', '.join(SKINS)}"); return
+    await sb.table("pets").update({"skin": skin}).eq("id", pid).execute()
+    await m.answer(f"✅ Скин «{skin}» установлен")
 
 
 @dp.message(Command("reset_scores"))
@@ -1024,143 +917,25 @@ async def cmd_reset_scores(m: Message):
     if not is_admin(m.from_user.id): return
     today = date.today().isoformat()
     await sb.table("members").update({"today_score": 0, "today_date": today}).neq("user_id", 0).execute()
-    await m.answer("✅ Дневные очки обнулены у всех.")
+    await m.answer("✅ Обнулено.")
 
 
 @dp.message(Command("xr"))
 async def cmd_xr(m: Message):
     if not is_admin(m.from_user.id): return
-    await m.answer("🔍 Проверяю xRocket…")
     bal = await get_app_balance(); ch = await list_xrocket_cheques()
     lines = ["<b>📊 xRocket</b>\n"]
     if bal:
         lines.append(f"✅ {bal['path']}")
         lines.append(f"<pre>{str(bal['data'])[:400]}</pre>")
     else: lines.append("❌ Не получил баланс.")
-    lines.append(f"\n🧾 Чеков: {len(ch)}")
-    for c in ch[:10]:
-        lines.append(f"• <code>{c.get('chequeId') or c.get('id')}</code> — {c.get('amount','?')}")
+    lines.append(f"🧾 Чеков: {len(ch)}")
     await m.answer("\n".join(lines), parse_mode="HTML")
-
-
-@dp.message(Command("cheques"))
-async def cmd_cheques(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    xr = await list_xrocket_cheques()
-    lines = ["🧾 <b>Чеки xRocket:</b> " + str(len(xr))]
-    for c in xr[:10]:
-        lines.append(f"• <code>{c.get('chequeId') or c.get('id')}</code> — {c.get('amount','?')}")
-
-    pet, _ = await resolve_pet(m, args) if args else (None, None)
-    if pet:
-        db = await many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
-        lines.append(f"\n<b>{pet['name']}</b>: {len(db)} в БД")
-    else:
-        pets = await my_pets(m.from_user.id)
-        for p in pets[:5]:
-            db = await many(sb.table("cheques").select("*").eq("pet_id", p["id"]).eq("status","sent"))
-            lines.append(f"\n<b>{p['name']}</b>: {len(db)}")
-    lines.append("\n/cancel_cheques [pet_id] — отменить")
-    await m.answer("\n".join(lines), parse_mode="HTML")
-
-
-@dp.message(Command("cancel_cheques"))
-async def cmd_cancel_cheques(m: Message):
-    if not is_admin(m.from_user.id): return
-    args = m.text.split()[1:]
-    pet, _ = await resolve_pet(m, args)
-    if not pet: return
-
-    xr = await list_xrocket_cheques()
-    db = await many(sb.table("cheques").select("*").eq("pet_id", pet["id"]).eq("status","sent"))
-    ids = {}
-    for c in xr:
-        cid = c.get("chequeId") or c.get("id")
-        if cid: ids[str(cid)] = {"amount": c.get("amount") or 0}
-    for c in db:
-        cid = c.get("cheque_id")
-        if cid and str(cid) not in ids: ids[str(cid)] = {"amount": c.get("amount") or 0}
-    if not ids:
-        await m.answer(f"Нет чеков.\n{pet_line(pet)}", parse_mode="HTML"); return
-    await m.answer(f"🔍 Отменяю {len(ids)}…\n{pet_line(pet)}", parse_mode="HTML")
-    ok = 0; fail = 0; refund = 0.0
-    for cid, info in ids.items():
-        try:
-            await delete_cheque(cid); ok += 1
-            refund += float(info.get("amount") or 0)
-            await sb.table("cheques").update({"status": "cancelled"}).eq("cheque_id", cid).execute()
-        except: fail += 1
-    if refund > 0:
-        pn = await one(sb.table("pets").select("*").eq("id", pet["id"]))
-        cb = float(pn.get("bank_balance") or 0)
-        await sb.table("pets").update({"bank_balance": round(cb + refund, 6)}).eq("id", pet["id"]).execute()
-    await m.answer(
-        f"✅ Отменено: {ok}\nОшибок: {fail}\nВозвращено: {refund:.4f} USDT\n{pet_line(pet)}",
-        parse_mode="HTML")
-
-
-# ============ create / my_pets ============
-
-@dp.callback_query(F.data == "create")
-async def cb_create(call: CallbackQuery):
-    user = call.from_user; pet = None
-    for _ in range(5):
-        code = gen_code()
-        try:
-            r = await sb.table("pets").insert({"owner_id": user.id, "invite_code": code}).execute()
-            if r.data: pet = r.data[0]; break
-        except Exception as e:
-            if "23505" not in str(e): break
-    if not pet: await call.answer("Ошибка.", show_alert=True); return
-    await sb.table("members").insert({"pet_id": pet["id"], "user_id": user.id,
-        "first_name": user.first_name or "Гость", "username": user.username}).execute()
-    await call.answer("Готово!")
-    me = await bot.get_me()
-    link = f"https://t.me/{me.username}?start=join_{pet['invite_code']}"
-    share = f"https://t.me/share/url?url={link}&text=Ухаживай за питомцем!"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🐾 Открыть", web_app=WebAppInfo(url=webapp_url(pet["id"])))],
-        [InlineKeyboardButton(text="📤 Поделиться", url=share)]])
-    await call.message.answer(
-        f"🐣 <b>Питомец создан!</b>\n\n<b>{pet['name']}</b>\nID: <code>{pet['id']}</code>\n\nСсылка:\n<code>{link}</code>",
-        parse_mode="HTML", reply_markup=kb)
-
-
-@dp.callback_query(F.data == "my_pets")
-async def cb_my_pets(call: CallbackQuery):
-    await call.answer()
-    data = await many(sb.table("members").select("pet_id, score, pets!inner(id, name, xp)")\
-                .eq("user_id", call.from_user.id).order("score", desc=True).limit(20))
-    if not data:
-        await call.message.answer("Нет питомцев."); return
-    lines = ["📋 <b>Твои питомцы:</b>\n"]
-    rows = []
-    for m in data:
-        p = m.get("pets") or {}
-        if not p: continue
-        lvl = min(30, (p.get("xp") or 0)//50+1)
-        lines.append(f"• <b>{p['name']}</b> · ур. {lvl}\n  <code>{p['id']}</code>")
-        rows.append([InlineKeyboardButton(text=f"🐾 {p['name']} · ур. {lvl}",
-                     web_app=WebAppInfo(url=webapp_url(p["id"])))])
-    await call.message.answer("\n".join(lines), parse_mode="HTML",
-                              reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 
 @dp.message(Command("help"))
 async def cmd_help(m: Message):
-    await m.answer(
-        "🐾 <b>Игра про общего питомца</b>\n\n"
-        "• /start — создать питомца\n"
-        "• /pet — мои питомцы\n"
-        "• /pet help — справка по командам\n"
-        "• /pet имя покормить — покормить\n"
-        "• /pet имя погладить — погладить\n"
-        "• /pet имя играть — поиграть\n"
-        "• /pet имя помыть — помыть\n"
-        "• /pet имя лечить — полечить (30 очков)\n"
-        "• /pet имя kd — кулдауны",
-        parse_mode="HTML")
+    await m.answer("🐾 Игра про общего питомца.\n/pet help — команды для чата")
 
 
 # ============ health + webhook ============
@@ -1180,14 +955,20 @@ async def xrocket_webhook(request: web.Request):
     if any(k in status for k in ("paid","success","completed","invoice_paid")):
         pet = await one(sb.table("pets").select("*").eq("id", inv["pet_id"]))
         if pet:
-            nb = float(pet.get("bank_balance") or 0) + float(inv["amount"])
+            paid_amount = float(inv["amount"])
+            fee = round(paid_amount * PLATFORM_FEE_PCT, 6)
+            net = round(paid_amount - fee, 6)
+            nb = float(pet.get("bank_balance") or 0) + net
             await sb.table("pets").update({"bank_balance": nb}).eq("id", inv["pet_id"]).execute()
             await sb.table("invoices").update({"status": "paid"}).eq("invoice_id", str(iid)).execute()
             try:
-                await bot.send_message(inv["owner_id"],
-                    f"✅ <b>Оплата получена</b>\n{pet_line(pet)}\nБаланс: <b>{nb:.4f} USDT</b>",
-                    parse_mode="HTML")
-            except: pass
+                await sb.table("platform_fees").insert({
+                    "pet_id": inv["pet_id"], "owner_id": inv["owner_id"],
+                    "amount": fee, "currency": inv.get("currency", "USDT"),
+                    "invoice_id": str(iid),
+                }).execute()
+            except Exception as e:
+                log.warning("fee insert: %s", e)
     return web.json_response({"ok": True})
 
 
@@ -1212,8 +993,10 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     me = await bot.get_me()
-    log.info("🤖 @%s стартовал (admins: %s)", me.username, ADMIN_IDS)
+    log.info("🤖 @%s стартовал", me.username)
+
     await start_web_server()
+    asyncio.create_task(death_watch_loop())
     await dp.start_polling(bot)
 
 
